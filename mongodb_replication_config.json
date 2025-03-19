@@ -1,0 +1,48 @@
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "test"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27018/?replicaSet=rs1",
+        "database": "test",
+        "collections": [
+          {
+            "sourceCollection": "customers",
+            "targetCollection": "customers"
+          }
+        ]
+      }
+    }
+  ],
+  "saveThreshold": 1000,
+  "checkpointInterval": 5,
+  "forceOrderedOperations": false,
+  "flushIntervalMs": 500,
+  
+  "initialReadBatchSize": 8192,
+  "initialWriteBatchSize": 100,
+  "initialChannelBufferSize": 10,
+  "initialMigrationWorkers": 8,
+  
+  "incrementalReadBatchSize": 8192,
+  "incrementalWriteBatchSize": 128,
+  "incrementalWorkerCount": 6,
+  "statsIntervalMinutes": 1,
+  
+  "parallelReadsEnabled": true,
+  "maxReadPartitions": 8,
+  "minDocsPerPartition": 10000,
+  "minDocsForParallelReads": 50000,
+  "sampleSize": 1000,
+  
+  "retryConfig": {
+    "maxRetries": 10,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
+    "enableBatchSplitting": true,
+    "minBatchSize": 10
+  }
+}
