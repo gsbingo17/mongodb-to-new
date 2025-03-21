@@ -102,6 +102,26 @@ func (r *RetryManager) RetryWithBackoff(ctx context.Context, operation func() er
 			continue
 		}
 
+		// Special handling for connection errors - add extra 5 seconds to the backoff
+		if r.ClassifyError(err) == ErrorTypeConnection {
+			// Calculate regular backoff
+			regularDelay := r.calculateBackoff(attempt)
+			// Add extra 5 seconds
+			totalDelay := regularDelay + (5 * time.Second)
+
+			r.Logger.Infof("Connection error detected. Adding extra 5 seconds to backoff. Waiting %v before retry %d/%d...",
+				totalDelay, attempt+1, r.MaxRetries)
+
+			// Wait for the total delay or until context is canceled
+			select {
+			case <-time.After(totalDelay):
+				// Continue to next attempt
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+
 		// Calculate delay with exponential backoff and jitter for non-contention errors
 		delay := r.calculateBackoff(attempt)
 
