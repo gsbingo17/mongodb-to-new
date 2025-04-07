@@ -37,7 +37,11 @@ func NewCollectionPartitioner(sourceCollection *mongo.Collection,
 // Partition creates partitions for a collection
 func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error) {
 	// Count documents to determine if partitioning is needed
-	count, err := p.sourceCollection.CountDocuments(ctx, bson.D{})
+	// Use a longer timeout for the count operation
+	countCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	count, err := p.sourceCollection.CountDocuments(countCtx, bson.D{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to count documents: %w", err)
 	}

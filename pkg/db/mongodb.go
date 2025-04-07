@@ -23,13 +23,13 @@ func NewMongoDB(connectionString, databaseName string, log *logger.Logger) (*Mon
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).
-		SetMaxPoolSize(30).
-		SetMinPoolSize(10).
+		SetMaxPoolSize(256).
+		SetMinPoolSize(128).
 		SetConnectTimeout(30 * time.Second).
-		SetSocketTimeout(45 * time.Second)
+		SetSocketTimeout(120 * time.Second)
 
 	// Connect to MongoDB
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, clientOptions)
