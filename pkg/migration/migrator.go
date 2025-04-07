@@ -112,13 +112,8 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		// For migrate mode, use a wait group to process collections in parallel
 		var wg sync.WaitGroup
 		// Create a semaphore to limit concurrency
-		// Calculate concurrent collections based on worker count
-		// Use half the worker count as a reasonable default, with a minimum of 1
-		concurrentCollections := 4
-		if m.config.InitialMigrationWorkers > 0 {
-			// Use half the worker count, but at least 1
-			concurrentCollections = max(4, m.config.InitialMigrationWorkers)
-		}
+		// Use the dedicated parameter for concurrent collections
+		concurrentCollections := m.config.ConcurrentCollections
 		m.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
 		semaphore := make(chan struct{}, concurrentCollections)
 
@@ -651,15 +646,88 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			}
 			defer cursor.Close(ctx)
 
-			// Process documents in batches
+			// Set up parallel batch processing within this partition
+			var partitionWg sync.WaitGroup
+			partitionBatchChan := make(chan []interface{}, m.config.InitialChannelBufferSize) // Buffer for batches
+			partitionErrorChan := make(chan error, 1)                                         // Channel for errors
+			partitionDoneChan := make(chan struct{})                                          // Channel to signal completion
+
+			// Track progress for this partition
+			var partitionMigratedCount int64
+			var partitionMu sync.Mutex // Mutex for thread-safe updates to partitionMigratedCount
+
+			// Start worker pool for this partition
+			workerCount := m.config.WorkersPerPartition
+			if workerCount < 1 {
+				workerCount = 1 // Ensure at least 1 worker per partition
+			}
+
+			m.log.Debugf("Starting %d workers for partition %d", workerCount, partitionIndex)
+
+			for w := 0; w < workerCount; w++ {
+				partitionWg.Add(1)
+				go func(workerID int) {
+					defer partitionWg.Done()
+
+					for batch := range partitionBatchChan {
+						// Use RetryManager to handle retries with batch splitting
+						err := retryManager.RetryWithSplit(ctx, batch, func(b []interface{}) error {
+							return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
+						})
+
+						if err != nil {
+							select {
+							case partitionErrorChan <- fmt.Errorf("worker %d in partition %d failed: %w", workerID, partitionIndex, err):
+							default:
+								// Error channel already has an error
+							}
+							return
+						}
+
+						// Update progress
+						partitionMu.Lock()
+						partitionMigratedCount += int64(len(batch))
+						partitionMu.Unlock()
+
+						// Update overall progress counter
+						mu.Lock()
+						migratedCount += int64(len(batch))
+						mu.Unlock()
+					}
+				}(w)
+			}
+
+			// Start a goroutine to close channels when all batches are processed
+			go func() {
+				partitionWg.Wait()
+				close(partitionDoneChan)
+			}()
+
+			// Process documents and create batches
 			var batch []interface{}
 			var batchCount int
-			var partitionMigratedCount int64
 
-			for cursor.Next(ctx) {
+			for {
+				// Check for errors from workers
+				select {
+				case err := <-partitionErrorChan:
+					cursor.Close(ctx)
+					close(partitionBatchChan)
+					errorChan <- err
+					return
+				default:
+					// No errors, continue processing
+				}
+
+				// Get next document
+				if !cursor.Next(ctx) {
+					break
+				}
+
 				// Decode document
 				var doc bson.D
 				if err := cursor.Decode(&doc); err != nil {
+					close(partitionBatchChan)
 					errorChan <- fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
 					return
 				}
@@ -668,58 +736,71 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				batch = append(batch, doc)
 				batchCount++
 
-				// Process batch if it reaches the write batch size
+				// Send batch if it reaches the write batch size
 				if batchCount >= m.config.InitialWriteBatchSize {
-					// Use RetryManager to handle retries with batch splitting
-					err := retryManager.RetryWithSplit(ctx, batch, func(b []interface{}) error {
-						return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
-					})
-					if err != nil {
-						errorChan <- fmt.Errorf("failed to process batch in partition %d: %w", partitionIndex, err)
+					select {
+					case partitionBatchChan <- batch:
+						// Batch sent to worker
+					case err := <-partitionErrorChan:
+						// Error from a worker
+						cursor.Close(ctx)
+						close(partitionBatchChan)
+						errorChan <- err
+						return
+					case <-ctx.Done():
+						// Context cancelled
+						cursor.Close(ctx)
+						close(partitionBatchChan)
+						errorChan <- ctx.Err()
 						return
 					}
-
-					// Update progress
-					partitionMigratedCount += int64(len(batch))
-
-					// Update overall progress counter (no logging)
-					mu.Lock()
-					migratedCount += int64(len(batch))
-					mu.Unlock()
 
 					// Reset batch
 					batch = nil
 					batchCount = 0
-
-					// Add a small delay between batches to reduce contention
-					time.Sleep(5 * time.Millisecond)
 				}
 			}
 
 			// Check for cursor errors
 			if err := cursor.Err(); err != nil {
+				close(partitionBatchChan)
 				errorChan <- fmt.Errorf("cursor error in partition %d: %w", partitionIndex, err)
 				return
 			}
 
 			// Process any remaining documents
 			if len(batch) > 0 {
-				// Use RetryManager to handle retries with batch splitting for the final batch
-				err := retryManager.RetryWithSplit(ctx, batch, func(b []interface{}) error {
-					return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
-				})
-				if err != nil {
-					errorChan <- fmt.Errorf("failed to process final batch in partition %d: %w", partitionIndex, err)
+				select {
+				case partitionBatchChan <- batch:
+					// Final batch sent to worker
+				case err := <-partitionErrorChan:
+					// Error from a worker
+					close(partitionBatchChan)
+					errorChan <- err
+					return
+				case <-ctx.Done():
+					// Context cancelled
+					close(partitionBatchChan)
+					errorChan <- ctx.Err()
 					return
 				}
+			}
 
-				// Update progress
-				partitionMigratedCount += int64(len(batch))
+			// Close batch channel to signal workers to exit
+			close(partitionBatchChan)
 
-				// Update overall progress counter (no logging)
-				mu.Lock()
-				migratedCount += int64(len(batch))
-				mu.Unlock()
+			// Wait for all workers to finish or for an error
+			select {
+			case <-partitionDoneChan:
+				// All workers finished successfully
+			case err := <-partitionErrorChan:
+				// Error from a worker
+				errorChan <- err
+				return
+			case <-ctx.Done():
+				// Context cancelled
+				errorChan <- ctx.Err()
+				return
 			}
 
 			// Log partition completion at debug level only

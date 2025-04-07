@@ -31,7 +31,9 @@ This Go application replicates data from one MongoDB database to another MongoDB
 
 ## Configuration
 
-Create a `mongodb_replication_config.json` file: This file defines the replication settings, including the source and target MongoDB connection details. Here's an example:
+Create a `mongodb_replication_config.json` file: This file defines the replication settings, including the source and target MongoDB connection details. A complete sample configuration file with all available options is provided in `sample_config.json`.
+
+Here's a basic example:
 
 ### Full Database Migration (Automatic Collection Detection)
 
@@ -106,7 +108,8 @@ If you want to migrate only specific collections or rename collections during mi
 - **initialReadBatchSize**: Number of documents to read in a batch during initial migration (default: 8192).
 - **initialWriteBatchSize**: Number of documents to write in a batch during initial migration (default: 128).
 - **initialChannelBufferSize**: Size of channel buffer for batches during initial migration (default: 10).
-- **initialMigrationWorkers**: Number of worker goroutines for initial migration (default: 5).
+- **initialMigrationWorkers**: Number of worker goroutines for batch processing during standard migration (default: 5).
+- **concurrentCollections**: Number of collections to process concurrently (default: 4).
 - **incrementalReadBatchSize**: Number of change events to read at once (default: 8192).
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
@@ -120,6 +123,7 @@ If you want to migrate only specific collections or rename collections during mi
 - **minDocsPerPartition**: Minimum number of documents per partition (default: 10000).
 - **minDocsForParallelReads**: Minimum collection size for parallel reads (default: 50000).
 - **sampleSize**: Number of documents to sample for partitioning (default: 1000).
+- **workersPerPartition**: Number of worker goroutines per partition for parallel batch processing (default: 3).
 
 #### Retry Configuration
 - **retryConfig**: Configuration for retry mechanisms.
@@ -171,11 +175,68 @@ If you want to migrate only specific collections or rename collections during mi
 
 ## Key Features
 
-### Parallel Collection Processing
+### Multi-level Parallelism
 
-The application processes multiple collections in parallel:
-- In migrate mode, collections are processed concurrently with a semaphore limiting the maximum number of concurrent migrations.
-- In live mode, a client-level change stream is used to watch for changes across all collections in all databases simultaneously, providing more efficient replication.
+The application implements parallelism at multiple levels to maximize performance:
+
+1. **Collection-Level Parallelism**:
+   - Multiple collections are processed concurrently
+   - Controlled by the `concurrentCollections` parameter (default: 4)
+   - Each collection is processed in its own goroutine
+   - A semaphore limits the maximum number of concurrent collections
+   - Higher values allow more collections to be migrated simultaneously
+
+2. **Batch-Level Parallelism in Standard Migration**:
+   - For collections that don't use partitioning (smaller collections)
+   - Controlled by the `initialMigrationWorkers` parameter (default: 5)
+   - Documents are read sequentially but processed in batches by multiple workers
+   - Each worker processes batches in parallel
+
+3. **Partition-Level Parallelism**:
+   - For large collections (size >= `minDocsForParallelReads`)
+   - The collection is divided into partitions based on document ID ranges
+   - Controlled by the `maxReadPartitions` parameter (default: 8)
+   - Each partition is processed in its own goroutine with its own cursor
+   - Partitions are created using sampling to ensure even distribution
+
+4. **Batch-Level Parallelism within Partitions**:
+   - Within each partition, batches are processed by multiple workers
+   - Controlled by the `workersPerPartition` parameter (default: 3)
+   - Documents are read sequentially within each partition but processed in parallel
+   - Provides an additional level of parallelism for large collections
+
+5. **Change Stream Parallelism** (Live Mode):
+   - In live mode, a client-level change stream watches all collections
+   - Change events are distributed to workers based on document ID hash
+   - Controlled by the `incrementalWorkerCount` parameter (default: CPU cores)
+   - Ensures operations for the same document are always processed by the same worker
+
+### Tuning Parallelism Parameters
+
+For optimal performance, consider these guidelines:
+
+1. **concurrentCollections**:
+   - Set based on the number and size of collections
+   - Higher values process more collections simultaneously
+   - Consider memory constraints when setting this value
+   - For systems with many small collections, higher values (8-16) may improve throughput
+   - For systems with few large collections, lower values (2-4) may be more efficient
+
+2. **initialMigrationWorkers**:
+   - Set based on available CPU cores and I/O capacity
+   - Controls batch processing parallelism for standard migration
+   - For CPU-bound workloads: set to number of available cores
+   - For I/O-bound workloads: can be set higher than available cores
+
+3. **maxReadPartitions**:
+   - Controls how many partitions large collections are divided into
+   - Higher values create more partitions but with smaller document ranges
+   - Optimal values typically range from 4-16 depending on collection size
+
+4. **workersPerPartition**:
+   - Controls batch processing parallelism within each partition
+   - For balanced resource allocation: total_cores ÷ maxReadPartitions
+   - Avoid setting too high to prevent contention within partitions
 
 ### Enhanced Checkpoint Mechanism
 
@@ -235,7 +296,12 @@ For large collections, the application uses parallel reads to speed up the initi
 
 2. **Adaptive Partition Count**: The number of partitions is calculated based on collection size and configuration parameters.
 
-3. **Parallel Processing**: Each partition is processed in parallel, with its own cursor and worker goroutines.
+3. **Two-Level Parallelism**:
+   - **Partition-Level Parallelism**: Each partition is processed in parallel, with its own cursor
+   - **Batch-Level Parallelism**: Within each partition, multiple worker goroutines process batches in parallel
+   - **Configurable Worker Count**: The number of workers per partition can be configured using the `workersPerPartition` parameter
+
+4. **Efficient Batch Distribution**: Within each partition, batches are distributed to workers through channels, allowing for optimal resource utilization.
 
 ### Robust Retry Mechanism
 

@@ -19,7 +19,8 @@ type Config struct {
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
 	InitialWriteBatchSize    int `json:"initialWriteBatchSize"`    // Number of documents to write in a batch during initial migration
 	InitialChannelBufferSize int `json:"initialChannelBufferSize"` // Size of channel buffer for batches during initial migration
-	InitialMigrationWorkers  int `json:"initialMigrationWorkers"`  // Number of worker goroutines for initial migration
+	InitialMigrationWorkers  int `json:"initialMigrationWorkers"`  // Number of worker goroutines for batch processing
+	ConcurrentCollections    int `json:"concurrentCollections"`    // Number of collections to process concurrently
 
 	// Parameters for incremental replication
 	IncrementalReadBatchSize  int `json:"incrementalReadBatchSize"`  // Number of change events to read at once
@@ -33,6 +34,7 @@ type Config struct {
 	MinDocsPerPartition     int  `json:"minDocsPerPartition"`     // Minimum number of documents per partition
 	MinDocsForParallelReads int  `json:"minDocsForParallelReads"` // Minimum collection size for parallel reads
 	SampleSize              int  `json:"sampleSize"`              // Number of documents to sample for partitioning
+	WorkersPerPartition     int  `json:"workersPerPartition"`     // Number of worker goroutines per partition
 
 	// Retry configuration
 	RetryConfig RetryConfig `json:"retryConfig"` // Configuration for retry mechanisms
@@ -146,6 +148,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.InitialMigrationWorkers = 5 // Default to 5 worker goroutines
 	}
 
+	if config.ConcurrentCollections <= 0 {
+		config.ConcurrentCollections = 4 // Default to 4 concurrent collections
+	}
+
 	// Already set default values for incremental replication parameters above
 
 	// Set default values for parallel reads
@@ -163,6 +169,10 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	if config.SampleSize <= 0 {
 		config.SampleSize = 1000 // Default to 1,000 samples
+	}
+
+	if config.WorkersPerPartition <= 0 {
+		config.WorkersPerPartition = 3 // Default to 3 workers per partition
 	}
 
 	// Set default values for retry configuration

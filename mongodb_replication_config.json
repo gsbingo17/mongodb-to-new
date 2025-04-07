@@ -2,16 +2,20 @@
   "databasePairs": [
     {
       "source": {
-        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "connectionString": "mongodb://instance-1:27017/?replicaSet=rs0",
         "database": "test"
       },
       "target": {
-        "connectionString": "mongodb://localhost:27018/?replicaSet=rs1",
+        "connectionString": "mongodb://instance-1:27018/?replicaSet=rs1",
         "database": "test",
         "collections": [
           {
             "sourceCollection": "customers",
             "targetCollection": "customers"
+          },
+          {
+            "sourceCollection": "customers8",
+            "targetCollection": "customers8"
           }
         ]
       }
@@ -26,6 +30,7 @@
   "initialWriteBatchSize": 100,
   "initialChannelBufferSize": 10,
   "initialMigrationWorkers": 8,
+  "concurrentCollections": 4,
   
   "incrementalReadBatchSize": 8192,
   "incrementalWriteBatchSize": 128,
@@ -37,11 +42,12 @@
   "minDocsPerPartition": 10000,
   "minDocsForParallelReads": 50000,
   "sampleSize": 1000,
+  "workersPerPartition": 3,
   
   "retryConfig": {
-    "maxRetries": 10,
-    "baseDelayMs": 100,
-    "maxDelayMs": 5000,
+    "maxRetries": 20,
+    "baseDelayMs": 500,
+    "maxDelayMs": 10000,
     "enableBatchSplitting": true,
     "minBatchSize": 10
   }
