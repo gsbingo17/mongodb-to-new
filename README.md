@@ -132,6 +132,7 @@ If you want to migrate only specific collections or rename collections during mi
   - **maxDelayMs**: Maximum delay in milliseconds (default: 5000).
   - **enableBatchSplitting**: Enable batch splitting for contention errors (default: true).
   - **minBatchSize**: Minimum batch size for splitting (default: 10).
+  - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
 
 ## Usage
 
@@ -320,6 +321,14 @@ The application includes a sophisticated retry mechanism for handling errors:
    - Contention errors: Fixed delay before retry
    - Duplicate key errors: Automatic fallback to upsert operations
    - Connection errors: Exponential backoff with the full batch
+   - Invalid _id type errors: Automatic conversion of _id fields to strings when enabled
+
+5. **_id Type Conversion**: When `convertInvalidIds` is enabled:
+   - Detects errors like "_id must be an objectId, string, long; found int"
+   - Automatically converts problematic _id fields to strings
+   - Logs the conversion details for troubleshooting
+   - Retries the operation with the converted _id fields
+   - Only converts _id fields that cause errors, preserving the original types when possible
 
 ## Setting Up a Single-Node Replica Set for Development
 

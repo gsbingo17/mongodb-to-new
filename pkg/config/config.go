@@ -47,6 +47,7 @@ type RetryConfig struct {
 	MaxDelayMs           int  `json:"maxDelayMs"`           // Maximum delay in milliseconds
 	EnableBatchSplitting bool `json:"enableBatchSplitting"` // Enable batch splitting for contention errors
 	MinBatchSize         int  `json:"minBatchSize"`         // Minimum batch size for splitting
+	ConvertInvalidIds    bool `json:"convertInvalidIds"`    // Convert invalid _id types to string
 }
 
 // DatabasePair represents a source and target database pair
@@ -190,6 +191,12 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	if config.RetryConfig.MinBatchSize <= 0 {
 		config.RetryConfig.MinBatchSize = 10 // Default to 10 docs per batch
+	}
+
+	// Set default value for ConvertInvalidIds
+	// Default to true to automatically convert invalid _id types
+	if !config.RetryConfig.ConvertInvalidIds {
+		config.RetryConfig.ConvertInvalidIds = true
 	}
 
 	// No backward compatibility needed anymore

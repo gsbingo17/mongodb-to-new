@@ -3,12 +3,15 @@ package migration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -18,28 +21,31 @@ type ErrorType int
 const (
 	ErrorTypeConnection ErrorType = iota
 	ErrorTypeContention
+	ErrorTypeInvalidIdType // New error type for invalid _id type errors
 	ErrorTypeOther
 )
 
 // RetryManager handles retrying operations with different strategies
 type RetryManager struct {
-	MaxRetries       int
-	BaseDelay        time.Duration
-	MaxDelay         time.Duration
-	EnableBatchSplit bool
-	MinBatchSize     int
-	Logger           *logger.Logger
+	MaxRetries        int
+	BaseDelay         time.Duration
+	MaxDelay          time.Duration
+	EnableBatchSplit  bool
+	MinBatchSize      int
+	ConvertInvalidIds bool // New field to control _id conversion
+	Logger            *logger.Logger
 }
 
 // NewRetryManager creates a new retry manager
-func NewRetryManager(maxRetries int, baseDelay, maxDelay time.Duration, enableBatchSplit bool, minBatchSize int, log *logger.Logger) *RetryManager {
+func NewRetryManager(maxRetries int, baseDelay, maxDelay time.Duration, enableBatchSplit bool, minBatchSize int, convertInvalidIds bool, log *logger.Logger) *RetryManager {
 	return &RetryManager{
-		MaxRetries:       maxRetries,
-		BaseDelay:        baseDelay,
-		MaxDelay:         maxDelay,
-		EnableBatchSplit: enableBatchSplit,
-		MinBatchSize:     minBatchSize,
-		Logger:           log,
+		MaxRetries:        maxRetries,
+		BaseDelay:         baseDelay,
+		MaxDelay:          maxDelay,
+		EnableBatchSplit:  enableBatchSplit,
+		MinBatchSize:      minBatchSize,
+		ConvertInvalidIds: convertInvalidIds,
+		Logger:            log,
 	}
 }
 
@@ -67,6 +73,12 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 		strings.Contains(errStr, "WriteConflict") ||
 		strings.Contains(errStr, "exceeded time limit") {
 		return ErrorTypeContention
+	}
+
+	// Check for invalid _id type errors
+	if strings.Contains(errStr, "_id must be an objectId, string, long") {
+		r.Logger.Debugf("Invalid _id type error detected: %s", errStr)
+		return ErrorTypeInvalidIdType
 	}
 
 	return ErrorTypeOther
@@ -142,12 +154,39 @@ func (r *RetryManager) RetryWithBackoff(ctx context.Context, operation func() er
 
 // RetryWithSplit retries a batch operation with progressive splitting
 func (r *RetryManager) RetryWithSplit(ctx context.Context, batch []interface{},
-	processBatch func([]interface{}) error) error {
+	collectionName string, processBatch func([]interface{}) error) error {
 
 	// Try processing the full batch first
 	err := processBatch(batch)
 	if err == nil {
 		return nil
+	}
+
+	// If it's an invalid _id type error and conversion is enabled
+	if r.ClassifyError(err) == ErrorTypeInvalidIdType && r.ConvertInvalidIds {
+		r.Logger.Infof("Collection '%s': Invalid _id type error detected. Converting problematic _ids to strings.",
+			collectionName)
+
+		// Extract failed indices if possible
+		failedIndices, extractErr := r.extractFailedIndicesFromError(err)
+		if extractErr != nil {
+			r.Logger.Debugf("Could not extract failed indices: %v. Will check all documents.", extractErr)
+		}
+
+		// Convert invalid _ids, passing collection name
+		convertedBatch := r.convertInvalidIds(batch, failedIndices, collectionName)
+
+		// Retry with the converted batch
+		retryErr := processBatch(convertedBatch)
+		if retryErr == nil {
+			r.Logger.Infof("Collection '%s': Retry with converted _id fields succeeded",
+				collectionName)
+		} else {
+			r.Logger.Warnf("Collection '%s': Retry with converted _id fields failed: %v",
+				collectionName, retryErr)
+		}
+
+		return retryErr
 	}
 
 	// If batch splitting is not enabled or batch is already small, use backoff
@@ -167,12 +206,12 @@ func (r *RetryManager) RetryWithSplit(ctx context.Context, batch []interface{},
 		secondHalf := batch[mid:]
 
 		// Process each half
-		err1 := r.RetryWithSplit(ctx, firstHalf, processBatch)
+		err1 := r.RetryWithSplit(ctx, firstHalf, collectionName, processBatch)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		err2 := r.RetryWithSplit(ctx, secondHalf, processBatch)
+		err2 := r.RetryWithSplit(ctx, secondHalf, collectionName, processBatch)
 
 		// If both halves succeeded, return nil
 		if err1 == nil && err2 == nil {
@@ -254,4 +293,92 @@ func (r *RetryManager) calculateBackoff(attempt int) time.Duration {
 	}
 
 	return time.Duration(backoff)
+}
+
+// extractFailedIndicesFromError extracts the indices of documents that failed due to invalid _id type
+func (r *RetryManager) extractFailedIndicesFromError(err error) (map[int]bool, error) {
+	// This is a simplified implementation that doesn't extract specific indices
+	// In a real implementation, we would parse the error message to get specific indices
+	// For now, we'll return nil to indicate that all documents should be checked
+	return nil, nil
+}
+
+// convertInvalidIds converts invalid _id types to strings for specific documents
+func (r *RetryManager) convertInvalidIds(batch []interface{}, failedIndices map[int]bool, collectionName string) []interface{} {
+	// If no specific indices are provided, check all documents
+	checkAll := failedIndices == nil || len(failedIndices) == 0
+
+	// Create a new batch with converted _ids where needed
+	result := make([]interface{}, len(batch))
+	convertedCount := 0
+
+	for i, doc := range batch {
+		// Only process documents that failed or check all if no specific indices
+		if checkAll || failedIndices[i] {
+			switch d := doc.(type) {
+			case bson.D:
+				// Create a copy of the document
+				newDoc := make(bson.D, len(d))
+				copy(newDoc, d)
+
+				// Find and possibly convert the _id field
+				for j, elem := range newDoc {
+					if elem.Key == "_id" {
+						// Check if _id is not an ObjectId, string, or int64
+						switch elem.Value.(type) {
+						case primitive.ObjectID, string, int64:
+							// These types are acceptable, no conversion needed
+						default:
+							// Log with collection and _id information
+							r.Logger.Infof("Collection '%s': Converting _id %v (type: %T) to string",
+								collectionName, elem.Value, elem.Value)
+
+							// Convert to string
+							newDoc[j].Value = fmt.Sprintf("%v", elem.Value)
+							convertedCount++
+						}
+						break
+					}
+				}
+				result[i] = newDoc
+			case bson.M:
+				// Create a copy of the document
+				newDoc := make(bson.M, len(d))
+				for k, v := range d {
+					newDoc[k] = v
+				}
+
+				// Check if _id needs conversion
+				if id, ok := newDoc["_id"]; ok {
+					switch id.(type) {
+					case primitive.ObjectID, string, int64:
+						// These types are acceptable, no conversion needed
+					default:
+						// Log with collection and _id information
+						r.Logger.Infof("Collection '%s': Converting _id %v (type: %T) to string",
+							collectionName, id, id)
+
+						// Convert to string
+						newDoc["_id"] = fmt.Sprintf("%v", id)
+						convertedCount++
+					}
+				}
+				result[i] = newDoc
+			default:
+				// Unknown document type, keep as is
+				result[i] = doc
+			}
+		} else {
+			// Document didn't fail, keep as is
+			result[i] = doc
+		}
+	}
+
+	// Summary log
+	if convertedCount > 0 {
+		r.Logger.Infof("Collection '%s': Converted %d _id fields to strings",
+			collectionName, convertedCount)
+	}
+
+	return result
 }

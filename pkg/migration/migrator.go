@@ -258,6 +258,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		time.Duration(m.config.RetryConfig.MaxDelayMs)*time.Millisecond,
 		m.config.RetryConfig.EnableBatchSplitting,
 		m.config.RetryConfig.MinBatchSize,
+		m.config.RetryConfig.ConvertInvalidIds,
 		m.log,
 	)
 
@@ -290,7 +291,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 			for batch := range batchChan {
 				// Use RetryManager to handle retries with batch splitting
-				err := retryManager.RetryWithSplit(ctx, batch, func(b []interface{}) error {
+				err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
 					return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
 				})
 				if err != nil {
@@ -580,6 +581,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		time.Duration(m.config.RetryConfig.MaxDelayMs)*time.Millisecond,
 		m.config.RetryConfig.EnableBatchSplitting,
 		m.config.RetryConfig.MinBatchSize,
+		m.config.RetryConfig.ConvertInvalidIds,
 		m.log,
 	)
 
@@ -671,7 +673,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 					for batch := range partitionBatchChan {
 						// Use RetryManager to handle retries with batch splitting
-						err := retryManager.RetryWithSplit(ctx, batch, func(b []interface{}) error {
+						err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
 							return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
 						})
 
