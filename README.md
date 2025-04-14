@@ -1,6 +1,6 @@
 # MongoDB to MongoDB Migration and Replication Tool
 
-This Go application replicates data from one MongoDB database to another MongoDB database. It supports two modes of operation:
+This Go application replicates data from one MongoDB database to another MongoDB database, and supports migration from MongoDB to Firestore with MongoDB compatibility feature. It provides two modes of operation:
 
 - **Migrate:** Performs a one-time migration of data from a source MongoDB database to a target MongoDB database.
 - **Live:** Sets up a live replication using MongoDB change streams to continuously synchronize data between the two databases. This includes:
