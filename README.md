@@ -19,13 +19,14 @@ This Go application replicates data from one MongoDB database to another MongoDB
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/gsbingo17/mongodb-migration.git
-   cd mongodb-migration
+   git clone https://github.com/gsbingo17/mongodb-to-new.git
+   cd mongodb-to-new
    ```
 
 2. Build the application:
 
    ```bash
+   go mod tidy
    go build -o migrate ./cmd/migrate
    ```
 
