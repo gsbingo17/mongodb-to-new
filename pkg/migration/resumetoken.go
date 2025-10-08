@@ -6,11 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// ResumeToken represents a MongoDB change stream resume token
+// ResumeToken represents a MongoDB change stream resume token or timestamp
 type ResumeToken struct {
-	Data string `json:"_data"`
+	Data      string                   `json:"_data,omitempty"`
+	Timestamp *primitive.Timestamp     `json:"timestamp,omitempty"`
+	Type      string                   `json:"type,omitempty"`
+	RawData   map[string]interface{}   `json:"rawData,omitempty"`
 }
 
 // GetResumeTokenPath returns the path for a resume token file
@@ -31,10 +36,37 @@ func tryLoadToken(filePath string) (interface{}, error) {
 		return nil, fmt.Errorf("failed to read resume token file: %w", err)
 	}
 
-	// Parse JSON
+	// Try to parse as flexible JSON first
+	var rawData map[string]interface{}
+	if err := json.Unmarshal(data, &rawData); err != nil {
+		return nil, fmt.Errorf("failed to parse resume token JSON: %w", err)
+	}
+
+	// Check if this is a timestamp-based token (DocumentDB compatibility)
+	if tokenType, ok := rawData["type"].(string); ok && tokenType == "startAtOperationTime" {
+		if timestampData, ok := rawData["timestamp"]; ok {
+			// Handle timestamp conversion
+			if timestampMap, ok := timestampData.(map[string]interface{}); ok {
+				if t, hasT := timestampMap["T"].(float64); hasT {
+					if i, hasI := timestampMap["I"].(float64); hasI {
+						timestamp := primitive.Timestamp{T: uint32(t), I: uint32(i)}
+						return map[string]interface{}{
+							"timestamp": timestamp,
+							"type":      "startAtOperationTime",
+						}, nil
+					}
+				}
+			}
+		}
+		// Return the raw data if timestamp parsing fails
+		return rawData, nil
+	}
+
+	// Legacy resume token handling
 	var resumeToken ResumeToken
 	if err := json.Unmarshal(data, &resumeToken); err != nil {
-		return nil, fmt.Errorf("failed to parse resume token: %w", err)
+		// If structured parsing fails, try the raw data
+		return rawData, nil
 	}
 
 	// If the _data field is empty, return nil

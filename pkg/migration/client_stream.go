@@ -11,6 +11,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -60,42 +61,50 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 	// If no resume token is available, we need to create one and then perform initial migration
 	if globalResumeToken == nil {
-		r.log.Info("No global resume token found. Creating a new one and will perform initial migration.")
+		r.log.Info("No global resume token found. Creating initial timestamp for DocumentDB compatibility and will perform initial migration.")
 
-		// Create a change stream to get an initial resume token
-		initialChangeStream, err := r.sourceDB.CreateClientLevelChangeStream(ctx, nil, 0)
-		if err != nil {
-			return fmt.Errorf("failed to create initial client-level change stream: %w", err)
+		// For DocumentDB compatibility, use current timestamp instead of resume token
+		currentTime := primitive.Timestamp{T: uint32(time.Now().Unix()), I: 0}
+		r.log.Infof("Using current timestamp for DocumentDB compatibility: %v", currentTime)
+
+		// Create a timestamp-based token structure for compatibility
+		timestampToken := map[string]interface{}{
+			"timestamp": currentTime,
+			"type":      "startAtOperationTime",
 		}
 
-		// Get the initial resume token
-		initialResumeToken := initialChangeStream.ResumeToken()
-		r.log.Infof("Obtained initial resume token: %v", initialResumeToken)
-
-		// Convert the BSON resume token to a map with _data field
-		var initialResumeTokenDoc bson.M
-		if err := bson.Unmarshal(initialResumeToken, &initialResumeTokenDoc); err != nil {
-			r.log.Errorf("Error unmarshaling initial resume token: %v", err)
-		}
-		r.log.Infof("Converted initial resume token: %v", initialResumeTokenDoc)
-
-		// Save this initial resume token
-		if err := SaveResumeToken(globalResumeTokenPath, initialResumeTokenDoc); err != nil {
-			r.log.Errorf("Error saving initial global resume token: %v", err)
+		// Save this timestamp token
+		if err := SaveResumeToken(globalResumeTokenPath, timestampToken); err != nil {
+			r.log.Errorf("Error saving initial timestamp token: %v", err)
 		} else {
-			r.log.Info("Saved initial global resume token")
+			r.log.Info("Saved initial timestamp token for DocumentDB compatibility")
 		}
 
-		// Close the initial change stream
-		initialChangeStream.Close(ctx)
-
-		// Use the converted resume token
-		globalResumeToken = initialResumeTokenDoc
+		// Use the timestamp token
+		globalResumeToken = timestampToken
 
 		// Flag that we need to perform initial migration
 		needsInitialMigration = true
 	} else {
 		r.log.Info("Global resume token available. Starting incremental replication.")
+
+		// Check if this is an old resume token format and convert to timestamp if needed
+		if tokenMap, ok := globalResumeToken.(map[string]interface{}); ok {
+			if _, hasTimestamp := tokenMap["timestamp"]; !hasTimestamp {
+				// This is an old resume token format, convert to timestamp
+				r.log.Warn("Converting old resume token format to timestamp for DocumentDB compatibility")
+				currentTime := primitive.Timestamp{T: uint32(time.Now().Unix()), I: 0}
+				globalResumeToken = map[string]interface{}{
+					"timestamp": currentTime,
+					"type":      "startAtOperationTime",
+				}
+
+				// Save the converted token
+				if err := SaveResumeToken(globalResumeTokenPath, globalResumeToken); err != nil {
+					r.log.Errorf("Error saving converted timestamp token: %v", err)
+				}
+			}
+		}
 	}
 
 	// Perform initial migration if needed
