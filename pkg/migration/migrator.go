@@ -107,6 +107,14 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		return fmt.Errorf("failed to determine collections to process: %w", err)
 	}
 
+	// Sync indexes before data migration (if configured)
+	if len(pair.Target.Indexes) > 0 {
+		if err := m.syncIndexes(ctx, sourceDB, targetDB, pair); err != nil {
+			m.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+			// Continue with migration even if index sync has issues
+		}
+	}
+
 	// Process each collection
 	if mode == "migrate" {
 		// For migrate mode, use a wait group to process collections in parallel
@@ -143,7 +151,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		wg.Wait()
 	} else if mode == "live" {
 		// Use client-level change stream for live replication
-		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections); err != nil {
+		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair); err != nil {
 			// We don't need to check for context.Canceled here anymore as it's handled in the lower layers
 			return fmt.Errorf("error starting client-level replication: %w", err)
 		}
@@ -163,7 +171,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 }
 
 // startClientLevelReplication starts replication using a client-level change stream
-func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig) error {
+func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair) error {
 	m.log.Info("Starting client-level replication for all collections")
 
 	// Create client-level replicator
@@ -184,8 +192,8 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 		// Don't log about initial migration here, let the replicator handle it
 	}
 
-	// Start client-level replication
-	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath)
+	// Start client-level replication (which will handle index sync during initial migration)
+	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, pair, m)
 }
 
 // getCollectionsToProcess determines which collections to process
@@ -837,6 +845,83 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 // 	}
 // 	return b
 // }
+
+// syncIndexes synchronizes indexes from source to target collections
+func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.MongoDB, pair config.DatabasePair) error {
+	if len(pair.Target.Indexes) == 0 {
+		m.log.Debug("No indexes configured for sync")
+		return nil
+	}
+
+	m.log.Info("Starting index synchronization...")
+
+	for _, indexConfig := range pair.Target.Indexes {
+		m.log.Infof("Syncing indexes for collection: %s", indexConfig.SourceCollection)
+
+		// Get all indexes from source collection
+		sourceIndexes, err := sourceDB.ListIndexes(ctx, indexConfig.SourceCollection)
+		if err != nil {
+			m.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", indexConfig.SourceCollection, err)
+			continue
+		}
+
+		// Get target collection name
+		targetCollName := m.getTargetCollectionName(indexConfig.SourceCollection, pair)
+
+		// Filter to only requested indexes
+		for _, indexDef := range sourceIndexes {
+			indexName, ok := indexDef["name"].(string)
+			if !ok {
+				m.log.Warnf("Index definition missing name field: %v", indexDef)
+				continue
+			}
+
+			// Skip _id_ index (MongoDB creates this automatically)
+			if indexName == "_id_" {
+				continue
+			}
+
+			// Check if this index is in the requested list
+			found := false
+			for _, requestedName := range indexConfig.IndexNames {
+				if indexName == requestedName {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				continue
+			}
+
+			// Create index on target
+			m.log.Infof("Creating index '%s' on target collection '%s'", indexName, targetCollName)
+			if err := targetDB.CreateIndexFromDefinition(ctx, targetCollName, indexDef); err != nil {
+				// Log warning but continue - index creation failures are non-blocking
+				m.log.Warnf("Failed to create index '%s': %v (continuing anyway)", indexName, err)
+			} else {
+				m.log.Infof("Successfully created index '%s'", indexName)
+			}
+		}
+	}
+
+	m.log.Info("Index synchronization completed")
+	return nil
+}
+
+// getTargetCollectionName gets the target collection name for a source collection
+func (m *Migrator) getTargetCollectionName(sourceCollName string, pair config.DatabasePair) string {
+	// Search through collections configuration for explicit mapping
+	for _, coll := range pair.Target.Collections {
+		if coll.SourceCollection == sourceCollName {
+			return coll.TargetCollection
+		}
+	}
+
+	// If not found in explicit config, assume same name as source
+	m.log.Debugf("No explicit mapping for %s, using same collection name on target", sourceCollName)
+	return sourceCollName
+}
 
 func max(a, b int) int {
 	if a > b {

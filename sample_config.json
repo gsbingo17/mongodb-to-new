@@ -2,20 +2,31 @@
   "databasePairs": [
     {
       "source": {
-        "connectionString": "mongodb://instance-1:27017/?replicaSet=rs0",
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
         "database": "test"
       },
       "target": {
-        "connectionString": "mongodb://instance-1:27018/?replicaSet=rs1",
+        "connectionString": "mongodb://localhost:27018/?replicaSet=rs1",
         "database": "test",
         "collections": [
           {
             "sourceCollection": "customers",
-            "targetCollection": "customers"
+            "targetCollection": "customers",
+            "upsertMode": true
           },
           {
             "sourceCollection": "customers8",
             "targetCollection": "customers8"
+          }
+        ],
+        "indexes": [
+          {
+            "sourceCollection": "customers",
+            "indexNames": ["userName_1", "userName_1_email_1"]
+          },
+          {
+            "sourceCollection": "customers8",
+            "indexNames": ["userName_1", "userName_1_email_1"]
           }
         ]
       }
@@ -27,15 +38,15 @@
   "flushIntervalMs": 500,
   
   "initialReadBatchSize": 8192,
-  "initialWriteBatchSize": 100,
+  "initialWriteBatchSize": 128,
   "initialChannelBufferSize": 10,
-  "initialMigrationWorkers": 8,
+  "initialMigrationWorkers": 5,
   "concurrentCollections": 4,
   
   "incrementalReadBatchSize": 8192,
   "incrementalWriteBatchSize": 128,
-  "incrementalWorkerCount": 6,
-  "statsIntervalMinutes": 1,
+  "incrementalWorkerCount": 8,
+  "statsIntervalMinutes": 5,
   
   "parallelReadsEnabled": true,
   "maxReadPartitions": 8,
@@ -45,9 +56,9 @@
   "workersPerPartition": 3,
   
   "retryConfig": {
-    "maxRetries": 20,
-    "baseDelayMs": 500,
-    "maxDelayMs": 10000,
+    "maxRetries": 5,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
     "enableBatchSplitting": true,
     "minBatchSize": 10,
     "convertInvalidIds": true

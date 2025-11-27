@@ -53,7 +53,7 @@ func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollecti
 }
 
 // StartReplication starts the client-level replication
-func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string) error {
+func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string, pair config.DatabasePair, migrator *Migrator) error {
 	var changeStream *mongo.ChangeStream
 	var err error
 	var needsInitialMigration bool
@@ -102,6 +102,14 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 	if needsInitialMigration {
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
+
+		// Sync indexes before migrating data if configured
+		if len(pair.Target.Indexes) > 0 {
+			r.log.Info("Syncing indexes before initial migration")
+			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair); err != nil {
+				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+			}
+		}
 
 		// Use a semaphore to limit the number of concurrent collection migrations
 		// Process up to InitialMigrationWorkers collections concurrently
@@ -402,7 +410,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 			// Perform initial migration again
 			r.log.Info("Starting fresh with initial migration...")
-			return r.StartReplication(ctx, nil, globalResumeTokenPath)
+			return r.StartReplication(ctx, nil, globalResumeTokenPath, pair, migrator)
 		}
 
 		return fmt.Errorf("failed to create client-level change stream: %w", err)

@@ -135,6 +135,59 @@ If you want to migrate only specific collections or rename collections during mi
   - **minBatchSize**: Minimum batch size for splitting (default: 10).
   - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
 
+#### Index Synchronization Configuration
+- **indexes**: (Optional) An array of index configurations for synchronizing indexes from source to target collections.
+  - **sourceCollection**: The name of the source collection containing the indexes to sync.
+  - **indexNames**: An array of index names to synchronize (the tool will retrieve the full index definitions from the source).
+
+**Index Sync Behavior:**
+- Index synchronization occurs **only during initial migration** (not during incremental replication)
+- Indexes are created on the target collection **before data migration** begins
+- The tool automatically resolves the target collection name:
+  - If a mapping is defined in the `collections` configuration, it uses the mapped target collection name
+  - If no mapping is found, it assumes the target collection has the same name as the source collection
+- **Non-blocking errors**: If index creation fails, the tool logs a warning and continues with data migration
+- **Preserves existing indexes**: Indexes already present on the target collection that don't exist in the source are kept unchanged
+- The `_id_` index is automatically skipped as it's created by MongoDB
+
+**Example Configuration:**
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "target_db",
+        "collections": [
+          {
+            "sourceCollection": "users",
+            "targetCollection": "app_users"
+          }
+        ],
+        "indexes": [
+          {
+            "sourceCollection": "users",
+            "indexNames": ["email_1", "created_at_-1"]
+          },
+          {
+            "sourceCollection": "orders",
+            "indexNames": ["user_id_1", "status_1_created_at_-1"]
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+In this example:
+- The `email_1` and `created_at_-1` indexes from the `users` collection will be created on the `app_users` collection (following the collection mapping)
+- The `user_id_1` and `status_1_created_at_-1` indexes from the `orders` collection will be created on the `orders` collection (same name, no mapping)
+
 ## Usage
 
 1. Migrate Mode:

@@ -131,3 +131,111 @@ func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken
 	m.log.Info("Created client-level change stream watching all databases and collections")
 	return changeStream, nil
 }
+
+// ListIndexes returns all indexes for a collection
+func (m *MongoDB) ListIndexes(ctx context.Context, collectionName string) ([]bson.M, error) {
+	collection := m.GetCollection(collectionName)
+	cursor, err := collection.Indexes().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list indexes for collection %s: %w", collectionName, err)
+	}
+	defer cursor.Close(ctx)
+
+	var indexes []bson.M
+	if err = cursor.All(ctx, &indexes); err != nil {
+		return nil, fmt.Errorf("failed to decode indexes: %w", err)
+	}
+
+	return indexes, nil
+}
+
+// CreateIndexFromDefinition creates an index on a collection using an index definition
+func (m *MongoDB) CreateIndexFromDefinition(ctx context.Context, collectionName string, indexDef bson.M) error {
+	collection := m.GetCollection(collectionName)
+
+	// Extract index name
+	indexName, ok := indexDef["name"].(string)
+	if !ok {
+		return fmt.Errorf("index definition missing 'name' field")
+	}
+
+	// Extract index keys and ensure they're in ordered format
+	keysRaw, ok := indexDef["key"]
+	if !ok {
+		return fmt.Errorf("index definition missing 'key' field")
+	}
+
+	// Convert keys to bson.D (ordered) format to preserve field order
+	// Note: bson.D is an alias for primitive.D, and bson.M is an alias for primitive.M
+	var keys bson.D
+	switch k := keysRaw.(type) {
+	case bson.D:
+		// bson.D and primitive.D are the same type
+		keys = k
+	case bson.M:
+		// bson.M and primitive.M are the same type
+		// Convert bson.M to bson.D
+		// Note: Map iteration order is preserved in Go 1.12+ for unmodified maps
+		for key, value := range k {
+			keys = append(keys, bson.E{Key: key, Value: value})
+		}
+	default:
+		return fmt.Errorf("unexpected type for index keys: %T", keysRaw)
+	}
+
+	// Build index model
+	indexModel := mongo.IndexModel{
+		Keys: keys,
+	}
+
+	// Build index options
+	opts := options.Index().SetName(indexName)
+
+	// Add unique constraint if present
+	if unique, ok := indexDef["unique"].(bool); ok && unique {
+		opts.SetUnique(true)
+	}
+
+	// Add sparse option if present
+	if sparse, ok := indexDef["sparse"].(bool); ok && sparse {
+		opts.SetSparse(true)
+	}
+
+	// Add TTL (expireAfterSeconds) if present
+	if expireAfter, ok := indexDef["expireAfterSeconds"].(int32); ok {
+		opts.SetExpireAfterSeconds(expireAfter)
+	}
+
+	// Add partial filter expression if present
+	if partialFilter, ok := indexDef["partialFilterExpression"]; ok {
+		opts.SetPartialFilterExpression(partialFilter)
+	}
+
+	// Add text index options if present
+	if defaultLanguage, ok := indexDef["default_language"].(string); ok {
+		opts.SetDefaultLanguage(defaultLanguage)
+	}
+	if languageOverride, ok := indexDef["language_override"].(string); ok {
+		opts.SetLanguageOverride(languageOverride)
+	}
+
+	// Add text index weights if present
+	if weights, ok := indexDef["weights"]; ok {
+		opts.SetWeights(weights)
+	}
+
+	// Add background option if present (deprecated in MongoDB 4.2+, but still supported)
+	if background, ok := indexDef["background"].(bool); ok && background {
+		opts.SetBackground(true)
+	}
+
+	indexModel.Options = opts
+
+	// Create the index
+	_, err := collection.Indexes().CreateOne(ctx, indexModel)
+	if err != nil {
+		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
+	}
+
+	return nil
+}

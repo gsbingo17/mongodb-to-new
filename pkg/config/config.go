@@ -67,6 +67,7 @@ type TargetConfig struct {
 	ConnectionString string             `json:"connectionString"`
 	Database         string             `json:"database"`
 	Collections      []CollectionConfig `json:"collections,omitempty"`
+	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
 }
 
 // CollectionConfig represents a collection mapping
@@ -74,6 +75,12 @@ type CollectionConfig struct {
 	SourceCollection string `json:"sourceCollection"`
 	TargetCollection string `json:"targetCollection"`
 	UpsertMode       bool   `json:"upsertMode,omitempty"` // Use upsert by default instead of insert
+}
+
+// IndexSyncConfig represents index sync configuration for a collection
+type IndexSyncConfig struct {
+	SourceCollection string   `json:"sourceCollection"`
+	IndexNames       []string `json:"indexNames"`
 }
 
 // LoadConfig loads the configuration from a file
