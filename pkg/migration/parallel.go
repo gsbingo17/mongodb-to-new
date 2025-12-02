@@ -305,10 +305,11 @@ func (d *EventDistributor) saveResumeToken(resumeToken bson.Raw) {
 
 // WriteOperation represents a single write operation
 type WriteOperation struct {
-	DocumentID interface{}
-	Document   interface{}
-	Namespace  string
-	OpType     string
+	DocumentID        interface{}
+	Document          interface{}
+	UpdateDescription interface{} // For modifier updates ($set, $inc, etc.)
+	Namespace         string
+	OpType            string
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -404,14 +405,25 @@ func (w *Worker) ProcessEvent(event bson.M) {
 
 	documentKey, _ := event["documentKey"].(bson.M)
 	docID := documentKey["_id"]
-	fullDocument, _ := event["fullDocument"].(bson.M)
+	
+	// Get fullDocument as interface{} to support both bson.M and map[string]interface{}
+	// This is needed because legacy oplog replicator returns map[string]interface{}
+	fullDocument := event["fullDocument"]
+	
+	// Get updateDescription for modifier updates ($set, $inc, etc.)
+	updateDescription := event["updateDescription"]
+	
+	// Debug log for worker events
+	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v", 
+		w.id, opType, namespace, docID, fullDocument != nil, updateDescription != nil)
 
 	// Create write operation
 	op := WriteOperation{
-		DocumentID: docID,
-		Document:   fullDocument,
-		Namespace:  namespace,
-		OpType:     opType,
+		DocumentID:        docID,
+		Document:          fullDocument,
+		UpdateDescription: updateDescription,
+		Namespace:         namespace,
+		OpType:            opType,
 	}
 
 	// Check if we need to create a new group
@@ -579,11 +591,25 @@ func (w *Worker) processGroup(group OperationGroup) {
 	case "update":
 		var models []mongo.WriteModel
 		for _, op := range group.Operations {
-			model := mongo.NewReplaceOneModel().
-				SetFilter(bson.M{"_id": op.DocumentID}).
-				SetReplacement(op.Document).
-				SetUpsert(true)
-			models = append(models, model)
+			// Check if this is a modifier update (has updateDescription) or full replacement (has fullDocument)
+			if op.UpdateDescription != nil {
+				// Modifier update - use UpdateOne with update operators ($set, $inc, etc.)
+				model := mongo.NewUpdateOneModel().
+					SetFilter(bson.M{"_id": op.DocumentID}).
+					SetUpdate(op.UpdateDescription).
+					SetUpsert(true)
+				models = append(models, model)
+			} else if op.Document != nil {
+				// Full document replacement - use ReplaceOne
+				model := mongo.NewReplaceOneModel().
+					SetFilter(bson.M{"_id": op.DocumentID}).
+					SetReplacement(op.Document).
+					SetUpsert(true)
+				models = append(models, model)
+			} else {
+				w.log.Errorf("Update operation has neither updateDescription nor fullDocument for doc %v", op.DocumentID)
+				continue
+			}
 		}
 
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
@@ -599,8 +625,16 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
-						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-							w.log.Errorf("Retry update failed: %v", err)
+						
+						// Retry with the appropriate method based on operation type
+						if op.UpdateDescription != nil {
+							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
+								w.log.Errorf("Retry modifier update failed: %v", err)
+							}
+						} else if op.Document != nil {
+							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
+								w.log.Errorf("Retry replace update failed: %v", err)
+							}
 						}
 					}
 				}
@@ -615,11 +649,23 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Fall back to individual updates
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
-					if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-						if err == context.Canceled {
-							w.log.Debugf("Updating document %v canceled due to context cancellation", op.DocumentID)
-						} else {
-							w.log.Errorf("Error updating document %v: %v", op.DocumentID, err)
+					
+					// Use the appropriate method based on operation type
+					if op.UpdateDescription != nil {
+						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
+							if err == context.Canceled {
+								w.log.Debugf("Updating document %v (modifier) canceled due to context cancellation", op.DocumentID)
+							} else {
+								w.log.Errorf("Error updating document %v (modifier): %v", op.DocumentID, err)
+							}
+						}
+					} else if op.Document != nil {
+						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
+							if err == context.Canceled {
+								w.log.Debugf("Replacing document %v canceled due to context cancellation", op.DocumentID)
+							} else {
+								w.log.Errorf("Error replacing document %v: %v", op.DocumentID, err)
+							}
 						}
 					}
 				}

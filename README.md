@@ -188,6 +188,103 @@ In this example:
 - The `email_1` and `created_at_-1` indexes from the `users` collection will be created on the `app_users` collection (following the collection mapping)
 - The `user_id_1` and `status_1_created_at_-1` indexes from the `orders` collection will be created on the `orders` collection (same name, no mapping)
 
+#### Replication Method Configuration
+- **replicationMethod**: (Optional) Specifies the replication method for live mode. Possible values:
+  - `"changestream"` (default): Uses MongoDB change streams for incremental replication (requires MongoDB 3.6+ with replica set)
+  - `"oplog"`: Uses MongoDB oplog tailing for incremental replication (works with older MongoDB versions)
+
+**Oplog-Based Replication:**
+
+For databases that don't support change streams or for legacy MongoDB versions, you can use oplog-based replication:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://legacy:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "new_db",
+        "collections": [
+          {
+            "sourceCollection": "orders",
+            "targetCollection": "orders"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Legacy MongoDB Support (MongoDB 3.0/3.2):**
+
+For very old MongoDB versions (3.0, 3.2) that use wire protocol version 3, use the `oplog-legacy` replication method:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://oldserver:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://newserver:27018",
+        "database": "modern_db"
+      }
+    }
+  ]
+}
+```
+
+**Legacy Mode Implementation:**
+- Uses **mgo driver** for source MongoDB (supports wire version 3)
+- Uses **modern mongo-driver** for target MongoDB (supports wire version 12+)
+- Both drivers coexist in the same binary without conflicts
+- Leverages GTM legacy library with mgo for oplog tailing
+- Supports full initial migration + incremental replication
+- Perfect for migrating from MongoDB 3.0/3.2 to modern MongoDB/Firestore
+
+**When to Use oplog-legacy:**
+- Source MongoDB version 3.0, 3.2, or 3.4 (wire version 3)
+- Target MongoDB is modern version (3.6+ or wire version 6+)
+- You need to bridge the gap between very old and very new MongoDB versions
+
+**When to Use Oplog Replication (Standard):**
+- Source database doesn't support change streams
+- Migrating from MongoDB versions earlier than 3.6
+- Source MongoDB doesn't have change streams enabled
+- You need lower-level access to the operation log
+
+**Oplog Replication Behavior:**
+- Requires source MongoDB to be running as a replica set (oplog only exists on replica sets)
+- Uses the GTM (Go Tail Mongo) library for robust oplog tailing
+- Automatically handles reconnection and resume from last processed timestamp
+- Stores resume position in `oplogTimestamp-global.json` file
+- Same seamless initial + incremental migration flow as change streams:
+  1. Captures current oplog timestamp before initial migration
+  2. Performs full initial migration (including index sync if configured)
+  3. Starts tailing oplog from captured timestamp to catch all changes during migration
+- Filters operations to only process configured collections
+- Supports insert, update, and delete operations
+- Automatically converts oplog operations to unified event format
+
+**Oplog vs Change Streams:**
+
+| Feature | Change Streams | Oplog |
+|---------|---------------|-------|
+| MongoDB Version | 3.6+ | All versions with replica set |
+| API Level | High-level, structured events | Low-level, raw oplog entries |
+| Server-side Filtering | Yes | No (filtered client-side) |
+| Resume Token | Opaque binary token | Timestamp-based |
+| Recommended For | Modern MongoDB (3.6+) | Legacy MongoDB or special cases |
+
 ## Usage
 
 1. Migrate Mode:
@@ -417,6 +514,9 @@ This will allow you to use change streams, which are required for the live repli
 - `pkg/logger/`: Logging utilities.
 - `pkg/migration/`: Migration and replication logic.
   - `client_stream.go`: Client-level change stream implementation
+  - `oplog_replicator.go`: Oplog-based replication implementation using GTM
+  - `oplog_timestamp.go`: Oplog timestamp tracking and persistence
+  - `oplog_converter.go`: GTM operation to event conversion
   - `migrator.go`: Core migration and replication logic
   - `resumetoken.go`: Resume token management
   - `parallel.go`: Parallel processing implementation for live mode

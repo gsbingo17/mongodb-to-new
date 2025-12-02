@@ -2,31 +2,17 @@
   "databasePairs": [
     {
       "source": {
-        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
-        "database": "test"
+        "connectionString": "mongodb://127.0.0.1:27019/?replicaSet=rs30",
+        "database": "test",
+        "replicationMethod": "oplog-legacy"
       },
       "target": {
-        "connectionString": "mongodb://localhost:27018/?replicaSet=rs1",
-        "database": "test",
+        "connectionString": "mongodb://127.0.0.1:27017/?replicaSet=rs0",
+        "database": "mydb",
         "collections": [
           {
             "sourceCollection": "customers",
-            "targetCollection": "customers",
-            "upsertMode": true
-          },
-          {
-            "sourceCollection": "customers8",
-            "targetCollection": "customers8"
-          }
-        ],
-        "indexes": [
-          {
-            "sourceCollection": "customers",
-            "indexNames": ["userName_1", "userName_1_email_1"]
-          },
-          {
-            "sourceCollection": "customers8",
-            "indexNames": ["userName_1", "userName_1_email_1"]
+            "targetCollection": "customers7"
           }
         ]
       }

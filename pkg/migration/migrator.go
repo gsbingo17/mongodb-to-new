@@ -87,7 +87,19 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 
 // processDatabasePair processes a single database pair
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, mode string) error {
-	// Connect to source MongoDB
+	// Check if this is legacy mode - if so, handle it separately
+	if mode == "live" && pair.Source.ReplicationMethod == "oplog-legacy" {
+		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
+		collections := pair.Target.Collections
+		if len(collections) == 0 {
+			// Auto-detect not supported in legacy mode without connection
+			m.log.Warn("Legacy mode requires explicit collection configuration")
+			return fmt.Errorf("legacy mode requires collections to be specified in configuration")
+		}
+		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair)
+	}
+
+	// Connect to source MongoDB (modern driver)
 	m.log.Infof("Connecting to source MongoDB at %s", pair.Source.ConnectionString)
 	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, m.log)
 	if err != nil {
@@ -170,9 +182,28 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	return nil
 }
 
-// startClientLevelReplication starts replication using a client-level change stream
+// startClientLevelReplication starts replication using either change streams or oplog
 func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair) error {
-	m.log.Info("Starting client-level replication for all collections")
+	// Determine replication method
+	replicationMethod := pair.Source.ReplicationMethod
+	if replicationMethod == "" {
+		replicationMethod = "changestream" // Default to change stream
+	}
+
+	m.log.Infof("Starting replication using method: %s", replicationMethod)
+
+	if replicationMethod == "oplog" {
+		// Use oplog-based replication
+		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair)
+	} else {
+		// Use change stream-based replication (default)
+		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair)
+	}
+}
+
+// startChangeStreamReplication starts replication using change streams
+func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair) error {
+	m.log.Info("Starting change stream-based replication for all collections")
 
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
@@ -194,6 +225,94 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 
 	// Start client-level replication (which will handle index sync during initial migration)
 	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, pair, m)
+}
+
+// startOplogReplication starts replication using oplog tailing
+// This method now supports both legacy (mgo) and modern (mongo-driver) connections
+func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair) error {
+	m.log.Info("Starting oplog-based replication for all collections")
+
+	// Check if we should use legacy mode (for MongoDB 3.0/3.2)
+	// This can be detected or configured via a flag
+	useLegacy := false
+	if pair.Source.ReplicationMethod == "oplog-legacy" {
+		useLegacy = true
+	}
+
+	if useLegacy {
+		return m.startOplogReplicationLegacy(ctx, sourceDBName, targetDBName, collections, pair)
+	}
+
+	// Use modern oplog replicator
+	replicator := NewOplogReplicator(sourceDB, targetDB, m.config, m.log)
+
+	// Add all collections to the replicator
+	for _, collConfig := range collections {
+		replicator.AddCollection(sourceDBName, targetDBName, collConfig.SourceCollection, collConfig.TargetCollection)
+	}
+
+	// Load oplog timestamp if it exists
+	oplogTimestampPath := "oplogTimestamp-global.json"
+	oplogTimestamp, err := LoadOplogTimestamp(oplogTimestampPath)
+	if err != nil {
+		m.log.Warnf("Error loading oplog timestamp: %v. Will start from the beginning.", err)
+		oplogTimestamp = nil
+	}
+
+	// Convert to interface{} for compatibility with StartReplication signature
+	var globalTimestamp interface{}
+	if oplogTimestamp != nil {
+		globalTimestamp = oplogTimestamp
+	}
+
+	// Start oplog replication (which will handle index sync during initial migration)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
+}
+
+// startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
+func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair) error {
+	m.log.Info("Starting legacy oplog-based replication (using mgo driver for MongoDB 3.0/3.2)")
+
+	// Connect to source MongoDB using legacy driver (mgo)
+	m.log.Infof("Connecting to source MongoDB (legacy) at %s", pair.Source.ConnectionString)
+	sourceDBLegacy, err := db.NewMongoDBLegacy(pair.Source.ConnectionString, pair.Source.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to source MongoDB (legacy): %w", err)
+	}
+	defer sourceDBLegacy.Close()
+
+	// Connect to target MongoDB using modern driver
+	m.log.Infof("Connecting to target MongoDB (modern) at %s", pair.Target.ConnectionString)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, m.log)
+	if err != nil {
+		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
+	}
+	defer targetDB.Close(ctx)
+
+	// Create legacy oplog replicator
+	replicator := NewOplogReplicatorLegacy(sourceDBLegacy, targetDB, m.config, m.log)
+
+	// Add all collections to the replicator
+	for _, collConfig := range collections {
+		replicator.AddCollection(sourceDBName, targetDBName, collConfig.SourceCollection, collConfig.TargetCollection)
+	}
+
+	// Load oplog timestamp if it exists
+	oplogTimestampPath := "oplogTimestamp-global.json"
+	oplogTimestamp, err := LoadOplogTimestamp(oplogTimestampPath)
+	if err != nil {
+		m.log.Warnf("Error loading oplog timestamp: %v. Will start from the beginning.", err)
+		oplogTimestamp = nil
+	}
+
+	// Convert to interface{} for compatibility with StartReplication signature
+	var globalTimestamp interface{}
+	if oplogTimestamp != nil {
+		globalTimestamp = oplogTimestamp
+	}
+
+	// Start legacy oplog replication
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
 }
 
 // getCollectionsToProcess determines which collections to process

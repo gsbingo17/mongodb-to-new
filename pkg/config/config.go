@@ -58,8 +58,9 @@ type DatabasePair struct {
 
 // SourceConfig represents the source MongoDB configuration
 type SourceConfig struct {
-	ConnectionString string `json:"connectionString"`
-	Database         string `json:"database"`
+	ConnectionString  string `json:"connectionString"`
+	Database          string `json:"database"`
+	ReplicationMethod string `json:"replicationMethod,omitempty"` // "changestream" (default) or "oplog"
 }
 
 // TargetConfig represents the target MongoDB configuration
