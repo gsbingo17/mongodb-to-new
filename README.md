@@ -9,10 +9,60 @@ This Go application replicates data from one MongoDB database to another MongoDB
 
 ## Prerequisites
 
+### General Requirements
 - Go 1.21 or later
-- MongoDB server running and accessible
-- **MongoDB server configured to allow change streams (requires MongoDB 3.6 or later and a replica set)** 
-- For live replication, the source MongoDB must be running as a replica set
+- MongoDB servers running and accessible (both source and target)
+
+### Replication Method Requirements
+
+The tool supports three replication methods for live mode, each with different prerequisites:
+
+#### 1. Change Stream Replication (Default - `replicationMethod: "changestream"`)
+- **Source MongoDB**: Version 3.6 or later
+- **Replica Set**: Source MongoDB **must** be running as a replica set
+- **Recommended for**: Modern MongoDB deployments (3.6+)
+- **Advantages**: 
+  - High-level API with server-side filtering
+  - Structured change events
+  - Official MongoDB feature with long-term support
+
+#### 2. Oplog Replication (`replicationMethod: "oplog"`)
+- **Source MongoDB**: Any version with replica set support (2.0+)
+- **Replica Set**: Source MongoDB **must** be running as a replica set (oplog only exists on replica sets)
+- **Wire Protocol**: Modern wire protocol (version 6+)
+- **Recommended for**:
+  - MongoDB 3.0, 3.2, 3.4 (wire protocol version 6)
+  - Scenarios requiring low-level oplog access
+- **Advantages**:
+  - Works with older MongoDB versions that don't support change streams
+  - Direct access to operation log
+
+#### 3. Legacy Oplog Replication (`replicationMethod: "oplog-legacy"`)
+- **Source MongoDB**: MongoDB 3.0, 3.2, 3.4 (wire protocol version 3)
+- **Replica Set**: Source MongoDB **must** be running as a replica set
+- **Target MongoDB**: Modern MongoDB (3.6+) or MongoDB-compatible databases (e.g., Firestore)
+- **Recommended for**: 
+  - Migrating from very old MongoDB versions (3.0/3.2) to modern MongoDB
+  - Bridging the gap between legacy and modern MongoDB versions
+- **Implementation**:
+  - Uses dual-driver architecture (mgo for source, mongo-driver for target)
+  - Leverages GTM legacy library for oplog tailing
+  - Full initial migration + incremental replication support
+
+### Target MongoDB Requirements
+- **Migrate mode**: Any MongoDB version
+- **Live mode**: No specific version requirements (receives standard insert/update/delete operations)
+
+### Quick Decision Guide
+
+| Your Source MongoDB | Recommended Method | Configuration |
+|-------------------|-------------------|---------------|
+| MongoDB 3.6 or later | Change Streams | `"replicationMethod": "changestream"` (default) |
+| MongoDB 3.0, 3.2, 3.4 (wire v6) | Oplog | `"replicationMethod": "oplog"` |
+| MongoDB 3.0, 3.2, 3.4 (wire v3) | Legacy Oplog | `"replicationMethod": "oplog-legacy"` |
+| Single-node deployment | Migrate mode only | Not applicable (live mode requires replica set) |
+
+**Note**: All live replication methods require the source MongoDB to be running as a replica set. See "Setting Up a Single-Node Replica Set for Development" section below for local development setup.
 
 ## Installation
 
