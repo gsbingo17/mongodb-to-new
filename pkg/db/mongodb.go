@@ -7,6 +7,7 @@ import (
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -106,14 +107,40 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 
 // CreateClientLevelChangeStream creates a change stream at the client level
 // This watches for changes across all collections in all databases
+// Uses startAtOperationTime for DocumentDB compatibility instead of resumeAfter
 func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, batchSize int) (*mongo.ChangeStream, error) {
 	// Set pipeline for full document lookup on updates
 	pipeline := mongo.Pipeline{}
 
 	// Set options
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
+
+	// Handle resume token or start time
 	if resumeToken != nil {
-		opts.SetResumeAfter(resumeToken)
+		// Check if resumeToken is actually a timestamp for DocumentDB compatibility
+		switch v := resumeToken.(type) {
+		case primitive.Timestamp:
+			// Use startAtOperationTime for DocumentDB compatibility
+			opts.SetStartAtOperationTime(&v)
+			m.log.Infof("Using startAtOperationTime for DocumentDB compatibility: %v", v)
+		case *primitive.Timestamp:
+			opts.SetStartAtOperationTime(v)
+			m.log.Infof("Using startAtOperationTime for DocumentDB compatibility: %v", *v)
+		case map[string]interface{}:
+			// Try to extract timestamp from resume token map
+			if timestamp, ok := v["timestamp"].(primitive.Timestamp); ok {
+				opts.SetStartAtOperationTime(&timestamp)
+				m.log.Infof("Extracted timestamp from resume token, using startAtOperationTime: %v", timestamp)
+			} else {
+				// Fallback: try to use as resume token, but this might fail on DocumentDB
+				m.log.Warn("DocumentDB compatibility: Attempting to use resume token, but this may fail. Consider using timestamp instead.")
+				opts.SetResumeAfter(resumeToken)
+			}
+		default:
+			// Fallback: try to use as resume token, but this might fail on DocumentDB
+			m.log.Warn("DocumentDB compatibility: Attempting to use resume token, but this may fail. Consider using timestamp instead.")
+			opts.SetResumeAfter(resumeToken)
+		}
 	}
 
 	// Set batch size if provided
