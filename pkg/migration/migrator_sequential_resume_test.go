@@ -242,3 +242,21 @@ func TestMigrator_SequentialResumption_DryRunSkipsCheckpoint(t *testing.T) {
 		t.Fatalf("expected 0 checkpoint files in dry run mode, found %d", len(files))
 	}
 }
+
+func TestMigrator_SequentialResumption_DefaultCheckpointDir(t *testing.T) {
+	migrator := NewMigrator(&config.Config{}, logger.New())
+	if migrator.getCheckpointDir() != "." {
+		t.Errorf("expected default checkpoint dir '.', got '%s'", migrator.getCheckpointDir())
+	}
+
+	migrator.CheckpointDir = "/custom/path"
+	if migrator.getCheckpointDir() != "/custom/path" {
+		t.Errorf("expected custom checkpoint dir '/custom/path', got '%s'", migrator.getCheckpointDir())
+	}
+
+	migrator.CheckpointDir = ""
+	if migrator.getCheckpointDir() != "." {
+		t.Errorf("expected empty checkpoint dir to resolve to '.', got '%s'", migrator.getCheckpointDir())
+	}
+}
+

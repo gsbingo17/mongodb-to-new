@@ -35,8 +35,9 @@ type Migrator struct {
 // NewMigrator creates a new migrator
 func NewMigrator(config *config.Config, log *logger.Logger) *Migrator {
 	return &Migrator{
-		config: config,
-		log:    log,
+		config:        config,
+		log:           log,
+		CheckpointDir: ".",
 	}
 }
 
@@ -124,6 +125,14 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 
 	m.log.Info("Shutdown complete.")
 	return nil
+}
+
+// getCheckpointDir returns the configured checkpoint directory or "." as default
+func (m *Migrator) getCheckpointDir() string {
+	if m.CheckpointDir != "" {
+		return m.CheckpointDir
+	}
+	return "."
 }
 
 // getCheckpointPath generates a per-pair checkpoint file path
@@ -683,7 +692,8 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// Resumption planning & checkpoint initialization for sequential backfill
 	var resumeFilter bson.D
 	var previouslyMigratedDocs int64
-	checkpointPath := GetPartitionCheckpointPath(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialPartitionIndex, sequentialTotalSplits)
+	checkpointDir := m.getCheckpointDir()
+	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialPartitionIndex, sequentialTotalSplits)
 	checkpoint := &PartitionCheckpoint{
 		Database:                sourceDB.GetDatabaseName(),
 		Collection:              collConfig.SourceCollection,
@@ -695,7 +705,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	if !m.DryRun {
-		plan, err := DetermineBackfillResumptionPlan(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialTotalSplits)
+		plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialTotalSplits)
 		if err != nil {
 			m.log.Warnf("[%s.%s] Failed to determine resumption plan (%v), starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 		} else {
@@ -1014,7 +1024,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
 	if !m.DryRun {
-		if err := DeletePartitionCheckpoints(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+		if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
 			m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 		}
 	}
