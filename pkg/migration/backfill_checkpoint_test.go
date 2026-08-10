@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -307,3 +308,78 @@ func TestBackfillCheckpoint_SaveNilReturnsError(t *testing.T) {
 		t.Fatalf("expected error when saving nil checkpoint, got nil")
 	}
 }
+
+func TestGetBSONType(t *testing.T) {
+	oid, _ := primitive.ObjectIDFromHex("60a000000000000000000045")
+	now := time.Now().UTC()
+	dt := primitive.NewDateTimeFromTime(now)
+	ts := primitive.Timestamp{T: 12345, I: 1}
+	bin := primitive.Binary{Subtype: 0x00, Data: []byte{0x01, 0x02, 0x03}}
+	dec, _ := primitive.ParseDecimal128("123.456")
+
+	tests := []struct {
+		name     string
+		input    any
+		expected BSONType
+	}{
+		{"Nil", nil, ""},
+		{"ObjectID", oid, BSONTypeObjectID},
+		{"String", "hello world", BSONTypeString},
+		{"Int", int(42), BSONTypeNumber},
+		{"Int32", int32(42), BSONTypeNumber},
+		{"Int64", int64(42), BSONTypeNumber},
+		{"Float32", float32(42.5), BSONTypeNumber},
+		{"Float64", float64(42.5), BSONTypeNumber},
+		{"Decimal128", dec, BSONTypeNumber},
+		{"Time", now, BSONTypeDate},
+		{"PrimitiveDateTime", dt, BSONTypeDate},
+		{"Timestamp", ts, BSONTypeTimestamp},
+		{"Binary", bin, BSONTypeBinary},
+		{"ByteSlice", []byte{0x01, 0x02}, BSONTypeBinary},
+		{"BoolTrue", true, BSONTypeBool},
+		{"BoolFalse", false, BSONTypeBool},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetBSONType(tt.input)
+			if got != tt.expected {
+				t.Errorf("GetBSONType(%v) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPartitionCheckpoint_RecordBatchProgress(t *testing.T) {
+	cp := &PartitionCheckpoint{
+		Database:       "testdb",
+		Collection:     "testcoll",
+		PartitionIndex: 0,
+		TotalSplits:    1,
+	}
+
+	oid1, _ := primitive.ObjectIDFromHex("60a000000000000000000010")
+	oid2, _ := primitive.ObjectIDFromHex("60a000000000000000000020")
+
+	batch := []interface{}{
+		bson.D{{Key: "_id", Value: oid1}, {Key: "val", Value: "a"}},
+		bson.D{{Key: "_id", Value: "string-key-1"}, {Key: "val", Value: "b"}},
+		bson.D{{Key: "_id", Value: oid2}, {Key: "val", Value: "c"}},
+		bson.D{{Key: "_id", Value: "string-key-2"}, {Key: "val", Value: "d"}},
+	}
+
+	cp.RecordBatchProgress(batch, 4)
+
+	if cp.ApproximateDocsMigrated != 4 {
+		t.Errorf("expected ApproximateDocsMigrated to be 4, got %d", cp.ApproximateDocsMigrated)
+	}
+
+	if cp.TypeProgress[BSONTypeObjectID] == nil || cp.TypeProgress[BSONTypeObjectID].SavedLastID != oid2 {
+		t.Errorf("expected ObjectID SavedLastID to be %v, got %v", oid2, cp.TypeProgress[BSONTypeObjectID])
+	}
+
+	if cp.TypeProgress[BSONTypeString] == nil || cp.TypeProgress[BSONTypeString].SavedLastID != "string-key-2" {
+		t.Errorf("expected String SavedLastID to be %q, got %v", "string-key-2", cp.TypeProgress[BSONTypeString])
+	}
+}
+

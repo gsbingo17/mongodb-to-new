@@ -25,6 +25,7 @@ type InitialMigrator struct {
 	retryManager      *RetryManager
 	transformer       *FieldTransformer
 	DryRun            bool
+	CheckpointDir     string
 }
 
 // NewInitialMigrator creates a new shared initial migrator
@@ -95,7 +96,7 @@ func (r *InitialMigrator) Run(ctx context.Context, pair config.DatabasePair, mig
 				defer func() { <-semaphore }()
 
 				targetCollection := collConfig.TargetCollection
-				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)", 
+				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)",
 					sourceDB, sourceCollection, targetCollection, collConfig.UpsertMode)
 
 				sourceDBCollection := r.sourceDB.GetCollection(sourceCollection)
@@ -165,23 +166,92 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 	readBatchSize := r.config.InitialReadBatchSize
 	writeBatchSize := r.config.InitialWriteBatchSize
 
+	// Sequential migration operates as a single reader partition (partition index 0, total splits 1).
+	const (
+		partitionIndex = 0
+		totalSplits    = 1
+	)
+
+	checkpointPath := GetPartitionCheckpointPath(r.CheckpointDir, sourceDB, sourceCollection, partitionIndex, totalSplits)
+	plan, err := DetermineBackfillResumptionPlan(r.CheckpointDir, sourceDB, sourceCollection, totalSplits)
+	if err != nil {
+		r.log.Warnf("[%s.%s] Failed to determine backfill resumption plan: %v, falling back to fresh start", sourceDB, sourceCollection, err)
+		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
+	}
+
+	// Default to fresh start configuration
+	filter := bson.D{}
+	var previouslyMigratedDocs int64
+	checkpoint := &PartitionCheckpoint{
+		Database:       sourceDB,
+		Collection:     sourceCollection,
+		PartitionIndex: partitionIndex,
+		TotalSplits:    totalSplits,
+		TypeProgress:   make(map[BSONType]*TypeRangeBoundary),
+	}
+
+	switch plan.Mode {
+	case ResumptionModeDirect:
+		if len(plan.PartitionFilters) == 1 {
+			cp, loadErr := LoadPartitionCheckpoint(checkpointPath)
+			if loadErr != nil || cp == nil {
+				r.log.Warnf("[%s.%s] Failed to load partition checkpoint from %s: %v, falling back to fresh start", sourceDB, sourceCollection, checkpointPath, loadErr)
+			} else {
+				filter = plan.PartitionFilters[0]
+				checkpoint = cp
+				previouslyMigratedDocs = plan.TotalDocsMigrated()
+				r.log.Infof("[%s.%s] Resuming backfill directly from checkpoint (previously migrated ~%d docs)", sourceDB, sourceCollection, previouslyMigratedDocs)
+			}
+		} else {
+			r.log.Warnf("[%s.%s] Expected exactly 1 partition filter for direct resumption but got %d, falling back to fresh start", sourceDB, sourceCollection, len(plan.PartitionFilters))
+		}
+
+	case ResumptionModeResampleWithGlobalMin:
+		cp := &PartitionCheckpoint{
+			Database:                sourceDB,
+			Collection:              sourceCollection,
+			PartitionIndex:          partitionIndex,
+			TotalSplits:             totalSplits,
+			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+			ApproximateDocsMigrated: plan.TotalDocsMigrated(),
+		}
+		for t, minID := range plan.GlobalMinSafeIDs {
+			cp.TypeProgress[t] = &TypeRangeBoundary{BSONType: t, SavedLastID: minID}
+		}
+		resampleFilter, filterErr := BuildPartitionFilterFromCheckpoint(cp)
+		if filterErr == nil {
+			filter = resampleFilter
+			checkpoint = cp
+			previouslyMigratedDocs = plan.TotalDocsMigrated()
+			r.log.Infof("[%s.%s] Resuming backfill with global min safe boundaries (previously migrated ~%d docs)", sourceDB, sourceCollection, previouslyMigratedDocs)
+		} else {
+			r.log.Warnf("[%s.%s] Failed to build filter from global min safe boundaries: %v, falling back to fresh start", sourceDB, sourceCollection, filterErr)
+		}
+	}
+
+	saveThreshold := r.config.SaveThreshold
+	if saveThreshold <= 0 {
+		saveThreshold = 100
+	}
+	checkpointInterval := time.Duration(r.config.CheckpointIntervalMinutes) * time.Minute
+	if checkpointInterval <= 0 {
+		checkpointInterval = 5 * time.Minute
+	}
+
 	const maxCursorResumes = 10
 
 	var batch []interface{}
 	var successCount int64
 	var failedCount int64
 	var lastLoggedPercentage int = -1
-	var lastID interface{}
 	var cursorResumeCount int
+	var docsSinceLastCheckpoint int64
+	lastCheckpointTime := time.Now()
 
 	for {
-		var filter bson.D
-		if lastID == nil {
-			filter = bson.D{}
-		} else {
-			r.log.Infof("[%s.%s] Resuming cursor from _id=%v (resume attempt %d/%d)",
-				sourceDB, sourceCollection, lastID, cursorResumeCount, maxCursorResumes)
-			filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastID}}}}
+		if cursorResumeCount > 0 {
+			r.log.Infof("[%s.%s] Resuming cursor from checkpoint (resume attempt %d/%d) with filter: %v",
+				sourceDB, sourceCollection, cursorResumeCount, maxCursorResumes, filter)
 		}
 
 		findOpts := options.Find().
@@ -204,7 +274,6 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 				continue
 			}
 
-			lastID = extractDocID(doc)
 			batch = append(batch, doc)
 
 			if len(batch) >= writeBatchSize {
@@ -212,15 +281,34 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 				succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
 				successCount += succeeded
 				failedCount += batchSize - succeeded
+
+				if ctx.Err() == nil {
+					checkpoint.RecordBatchProgress(batch, succeeded)
+					docsSinceLastCheckpoint += succeeded
+
+					if docsSinceLastCheckpoint >= int64(saveThreshold) || time.Since(lastCheckpointTime) >= checkpointInterval {
+						if err := SavePartitionCheckpoint(checkpointPath, checkpoint); err != nil {
+							r.log.Warnf("[%s.%s] Failed to save periodic checkpoint: %v", sourceDB, sourceCollection, err)
+						} else {
+							docsSinceLastCheckpoint = 0
+							lastCheckpointTime = time.Now()
+						}
+					}
+				}
+
 				batch = nil
 
 				if count > 0 {
-					currentCount := successCount + failedCount
-					currentPercentage := int(float64(currentCount) / float64(count) * 10)
+					currentRunCount := successCount + failedCount
+					cumulativeCount := previouslyMigratedDocs + currentRunCount
+					if cumulativeCount > count {
+						cumulativeCount = count
+					}
+					currentPercentage := int(float64(cumulativeCount) / float64(count) * 10)
 					if currentPercentage > lastLoggedPercentage {
 						lastLoggedPercentage = currentPercentage
-						r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-							sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, successCount, failedCount)
+						r.log.Infof("Collection %s.%s progress: ~%d/%d documents (%.0f%%) [This run: %d successful, %d failed]",
+							sourceDB, sourceCollection, cumulativeCount, count, float64(currentPercentage)*10, successCount, failedCount)
 					}
 				}
 			}
@@ -233,31 +321,33 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 
 			if ctx.Err() != nil {
 				r.log.Infof("[%s.%s] Context canceled, stopping migration", sourceDB, sourceCollection)
+				_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
 				break
 			}
 
 			cursorResumeCount++
-			if lastID != nil && cursorResumeCount <= maxCursorResumes {
-				r.log.Infof("[%s.%s] Will attempt cursor resumption from last _id=%v", sourceDB, sourceCollection, lastID)
-
+			if cursorResumeCount <= maxCursorResumes {
 				if len(batch) > 0 {
 					batchSize := int64(len(batch))
 					succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
 					successCount += succeeded
 					failedCount += batchSize - succeeded
+					checkpoint.RecordBatchProgress(batch, succeeded)
 					batch = nil
 				}
 
+				_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
+				if resumeFilter, filterErr := BuildPartitionFilterFromCheckpoint(checkpoint); filterErr == nil {
+					filter = resumeFilter
+				} else {
+					r.log.Warnf("[%s.%s] Failed to rebuild resume filter from checkpoint (%v), continuing with previous filter: %v",
+						sourceDB, sourceCollection, filterErr, filter)
+				}
 				cursorFailed = true
 			} else {
-				currentCount = successCount + failedCount
-				if cursorResumeCount > maxCursorResumes {
-					r.log.Errorf("[%s.%s] Exceeded maximum cursor resume attempts (%d). Stopping migration at %d documents.",
-						sourceDB, sourceCollection, maxCursorResumes, currentCount)
-				} else {
-					r.log.Errorf("[%s.%s] Cursor error with no last _id to resume from. Stopping migration at %d documents.",
-						sourceDB, sourceCollection, currentCount)
-				}
+				r.log.Errorf("[%s.%s] Exceeded maximum cursor resume attempts (%d). Stopping migration at %d documents.",
+					sourceDB, sourceCollection, maxCursorResumes, currentCount)
+				_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
 				break
 			}
 		} else {
@@ -269,20 +359,29 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 		}
 	}
 
-	if len(batch) > 0 {
+	if len(batch) > 0 && ctx.Err() == nil {
 		batchSize := int64(len(batch))
 		succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
 		successCount += succeeded
 		failedCount += batchSize - succeeded
+		checkpoint.RecordBatchProgress(batch, succeeded)
+		batch = nil
 	}
 
 	totalCount := successCount + failedCount
-	if failedCount > 0 {
+	if ctx.Err() != nil {
+		r.log.Warnf("[%s.%s] Migration interrupted by context cancellation. Checkpoint saved for resumption.", sourceDB, sourceCollection)
+		_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
+	} else if failedCount > 0 {
 		r.log.Warnf("Migration for %s.%s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
 			sourceDB, sourceCollection, failedCount, successCount, failedCount, totalCount)
+		_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
 	} else {
 		r.log.Infof("Migration for %s.%s completed successfully! Total documents: %d",
 			sourceDB, sourceCollection, totalCount)
+		if err := DeletePartitionCheckpoints(r.CheckpointDir, sourceDB, sourceCollection); err != nil {
+			r.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB, sourceCollection, err)
+		}
 	}
 	return successCount, failedCount
 }
