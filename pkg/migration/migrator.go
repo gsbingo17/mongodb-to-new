@@ -24,11 +24,12 @@ import (
 
 // Migrator handles the migration and replication process
 type Migrator struct {
-	config       *config.Config
-	log          *logger.Logger
+	config        *config.Config
+	log           *logger.Logger
 	LiveStartTime *primitive.Timestamp
-	DryRun       bool
-	isLive       bool
+	DryRun        bool
+	CheckpointDir string
+	isLive        bool
 }
 
 // NewMigrator creates a new migrator
@@ -47,7 +48,6 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	if mode != "migrate" && mode != "live" && mode != "live-only" && mode != "retry-dlq" {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', or 'retry-dlq'", mode)
 	}
-
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
 
@@ -675,6 +675,83 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	m.log.Infof("Using read batch size: %d, write batch size: %d", readBatchSize, writeBatchSize)
 
+	const (
+		sequentialPartitionIndex = 0
+		sequentialTotalSplits    = 1
+	)
+
+	// Resumption planning & checkpoint initialization for sequential backfill
+	var resumeFilter bson.D
+	var previouslyMigratedDocs int64
+	checkpointPath := GetPartitionCheckpointPath(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialPartitionIndex, sequentialTotalSplits)
+	checkpoint := &PartitionCheckpoint{
+		Database:                sourceDB.GetDatabaseName(),
+		Collection:              collConfig.SourceCollection,
+		PartitionIndex:          sequentialPartitionIndex,
+		TotalSplits:             sequentialTotalSplits,
+		ApproximateDocsMigrated: 0,
+		TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+		UpdatedAt:               time.Now().UTC(),
+	}
+
+	if !m.DryRun {
+		plan, err := DetermineBackfillResumptionPlan(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialTotalSplits)
+		if err != nil {
+			m.log.Warnf("[%s.%s] Failed to determine resumption plan (%v), starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		} else {
+			switch plan.Mode {
+			case ResumptionModeDirect:
+				if len(plan.PartitionFilters) == sequentialTotalSplits {
+					loadedCP, cpErr := LoadPartitionCheckpoint(checkpointPath)
+					if cpErr != nil {
+						m.log.Warnf("[%s.%s] Direct resumption failed to load partition checkpoint (%v), starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, cpErr)
+					} else {
+						checkpoint = loadedCP
+						resumeFilter = plan.PartitionFilters[0]
+						previouslyMigratedDocs = plan.TotalDocsMigrated()
+						m.log.Infof("[%s.%s] Resuming backfill directly from checkpoint (previously migrated ~%d docs)", sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs)
+					}
+				} else {
+					m.log.Warnf("[%s.%s] Expected exactly %d partition filter for direct resumption but got %d, starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialTotalSplits, len(plan.PartitionFilters))
+				}
+
+			case ResumptionModeResampleWithGlobalMin:
+				cp := &PartitionCheckpoint{
+					Database:                sourceDB.GetDatabaseName(),
+					Collection:              collConfig.SourceCollection,
+					PartitionIndex:          sequentialPartitionIndex,
+					TotalSplits:             sequentialTotalSplits,
+					TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+					ApproximateDocsMigrated: plan.TotalDocsMigrated(),
+					UpdatedAt:               time.Now().UTC(),
+				}
+				for t, minID := range plan.GlobalMinSafeIDs {
+					cp.TypeProgress[t] = &TypeRangeBoundary{BSONType: t, SavedLastID: minID}
+				}
+				resampleFilter, filterErr := BuildPartitionFilterFromCheckpoint(cp)
+				if filterErr == nil {
+					resumeFilter = resampleFilter
+					checkpoint = cp
+					previouslyMigratedDocs = plan.TotalDocsMigrated()
+					m.log.Infof("[%s.%s] Resuming backfill with global min safe boundaries (previously migrated ~%d docs)", sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs)
+				} else {
+					m.log.Warnf("[%s.%s] Failed to build filter from global min safe boundaries (%v), starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, filterErr)
+				}
+			}
+		}
+	}
+
+	saveThreshold := m.config.SaveThreshold
+	if saveThreshold <= 0 {
+		saveThreshold = 100
+	}
+	checkpointInterval := time.Duration(m.config.CheckpointIntervalMinutes) * time.Minute
+	if checkpointInterval <= 0 {
+		checkpointInterval = 5 * time.Minute
+	}
+	var docsSinceLastCheckpoint int64
+	lastCheckpointTime := time.Now()
+
 	// Create retry manager for batch processing.
 	// [Safety Fix 8: Invalid ID Conversion] Firestore target APIs only support string, int64, or ObjectId document keys;
 	// arrays or nested subdocuments trigger terminal errors. Enabling ConvertInvalidIds
@@ -691,7 +768,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the MongoDB read cursor from timing out (default 10 minutes)
 	// when upstream readers are throttled or paused by write rate-limiting/backpressure downstream.
-	cursor, err := sourceCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
+	findFilter := bson.D{}
+	if resumeFilter != nil {
+		findFilter = resumeFilter
+	}
+	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}
@@ -752,12 +833,26 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				successCount += succeeded
 				failedCount += failed
 				migratedCount += int64(len(batch))
-				currentCount := migratedCount
-				currentSuccess := successCount
-				currentFailed := failedCount
 
-				// Calculate current percentage (0-10 for 0%-100%)
-				currentPercentage := int(float64(currentCount) / float64(totalCount) * 10)
+				if ctx.Err() == nil {
+					checkpoint.RecordBatchProgress(batch, succeeded)
+					docsSinceLastCheckpoint += succeeded
+
+					if !m.DryRun && (docsSinceLastCheckpoint >= int64(saveThreshold) || time.Since(lastCheckpointTime) >= checkpointInterval) {
+						if err := SavePartitionCheckpoint(checkpointPath, checkpoint); err != nil {
+							m.log.Warnf("[%s.%s] Failed to save periodic checkpoint: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+						} else {
+							docsSinceLastCheckpoint = 0
+							lastCheckpointTime = time.Now()
+						}
+					}
+				}
+
+				cumulativeCount := previouslyMigratedDocs + successCount + failedCount
+				if totalCount > 0 && cumulativeCount > totalCount {
+					cumulativeCount = totalCount
+				}
+				currentPercentage := int(float64(cumulativeCount) / float64(totalCount) * 10)
 
 				// Only log when crossing a 10% threshold at the collection level
 				// and update lastLoggedPercentage atomically to prevent multiple logs
@@ -771,11 +866,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				// Log outside the mutex lock to reduce lock contention
 				if shouldLog {
 					if failedCount > 0 {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10, currentSuccess, currentFailed)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%) [This run: %d successful, %d failed]",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10, successCount, failedCount)
 					} else {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%) [This run: %d successful, 0 failed]",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10, successCount)
 					}
 				}
 			}
@@ -844,7 +939,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				// Context cancelled
 				cursor.Close(ctx)
 				close(batchChan)
-				m.log.Info("Batch processing interrupted due to context cancellation")
+				if !m.DryRun && checkpoint != nil {
+					m.log.Warnf("[%s.%s] Migration interrupted by context cancellation. Checkpoint saved for resumption.", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+					_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
+				}
 				return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 			}
 
@@ -879,7 +977,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		case <-ctx.Done():
 			// Context cancelled
 			close(batchChan)
-			m.log.Info("Final batch processing interrupted due to context cancellation")
+			if !m.DryRun && checkpoint != nil {
+				m.log.Warnf("[%s.%s] Migration interrupted by context cancellation. Checkpoint saved for resumption.", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+				_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
+			}
 			return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 		}
 	}
@@ -896,16 +997,26 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		return successCount, failedCount, err
 	case <-ctx.Done():
 		// Context cancelled
-		m.log.Info("Migration interrupted due to context cancellation")
+		if !m.DryRun && checkpoint != nil {
+			m.log.Warnf("[%s.%s] Migration interrupted by context cancellation. Checkpoint saved for resumption.", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+			_ = SavePartitionCheckpoint(checkpointPath, checkpoint)
+		}
 		return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 	}
 
 	if failedCount > 0 {
-		m.log.Warnf("Migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
+		m.log.Warnf("Migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d (check DLQ for failed documents)",
 			collConfig.SourceCollection, failedCount, successCount, failedCount, migratedCount)
 	} else {
 		m.log.Infof("Migration for %s completed successfully! Total documents: %d",
 			collConfig.SourceCollection, migratedCount)
+	}
+
+	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
+	if !m.DryRun {
+		if err := DeletePartitionCheckpoints(m.CheckpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+			m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		}
 	}
 	return successCount, failedCount, nil
 }
