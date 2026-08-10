@@ -260,3 +260,35 @@ func TestMigrator_SequentialResumption_DefaultCheckpointDir(t *testing.T) {
 	}
 }
 
+func TestMigrator_SequentialResumption_MixedTypeFilterWithUnreachedTypes(t *testing.T) {
+	cp := &PartitionCheckpoint{
+		Database:       "bin_eval_mixed_db",
+		Collection:     "random_key_types",
+		PartitionIndex: 0,
+		TotalSplits:    1,
+		TypeProgress: map[BSONType]*TypeRangeBoundary{
+			BSONTypeNumber:   {BSONType: BSONTypeNumber, SavedLastID: int64(87000)},
+			BSONTypeString:   {BSONType: BSONTypeString, SavedLastID: nil},
+			BSONTypeBinary:   {BSONType: BSONTypeBinary, SavedLastID: nil},
+			BSONTypeObjectID: {BSONType: BSONTypeObjectID, SavedLastID: nil},
+		},
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	filter, err := BuildPartitionFilterFromCheckpoint(cp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Filter should be an $or with 4 clauses:
+	// 1 for in-progress number ($gte: 87000) and 3 for unreached types (string, binData, objectId)
+	orVal, ok := filter.Map()["$or"].([]bson.D)
+	if !ok {
+		t.Fatalf("expected $or with slice of bson.D, got %+v", filter)
+	}
+	if len(orVal) != 4 {
+		t.Fatalf("expected 4 clauses in $or filter, got %d", len(orVal))
+	}
+}
+
+

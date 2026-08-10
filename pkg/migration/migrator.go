@@ -692,17 +692,9 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// Resumption planning & checkpoint initialization for sequential backfill
 	var resumeFilter bson.D
 	var previouslyMigratedDocs int64
+	var checkpoint *PartitionCheckpoint
 	checkpointDir := m.getCheckpointDir()
 	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialPartitionIndex, sequentialTotalSplits)
-	checkpoint := &PartitionCheckpoint{
-		Database:                sourceDB.GetDatabaseName(),
-		Collection:              collConfig.SourceCollection,
-		PartitionIndex:          sequentialPartitionIndex,
-		TotalSplits:             sequentialTotalSplits,
-		ApproximateDocsMigrated: 0,
-		TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
-		UpdatedAt:               time.Now().UTC(),
-	}
 
 	if !m.DryRun {
 		plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, sequentialTotalSplits)
@@ -748,6 +740,26 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 					m.log.Warnf("[%s.%s] Failed to build filter from global min safe boundaries (%v), starting fresh", sourceDB.GetDatabaseName(), collConfig.SourceCollection, filterErr)
 				}
 			}
+		}
+	}
+
+	// If starting fresh (no checkpoint loaded for resumption), initialize checkpoint with all present BSON types
+	if checkpoint == nil {
+		presentTypes, typeErr := m.discoverPresentBSONTypes(ctx, sourceCollection)
+		if typeErr != nil {
+			return 0, 0, fmt.Errorf("failed to discover present BSON types for %s: %w", collConfig.SourceCollection, typeErr)
+		}
+		checkpoint = &PartitionCheckpoint{
+			Database:                sourceDB.GetDatabaseName(),
+			Collection:              collConfig.SourceCollection,
+			PartitionIndex:          sequentialPartitionIndex,
+			TotalSplits:             sequentialTotalSplits,
+			ApproximateDocsMigrated: 0,
+			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+			UpdatedAt:               time.Now().UTC(),
+		}
+		for _, t := range presentTypes {
+			checkpoint.TypeProgress[t] = &TypeRangeBoundary{BSONType: t}
 		}
 	}
 
@@ -1029,6 +1041,48 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		}
 	}
 	return successCount, failedCount, nil
+}
+
+// discoverPresentBSONTypes returns the unique BSON types of the _id field present in the collection.
+func (m *Migrator) discoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
+		}}},
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := collection.Aggregate(discoverCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
+	}
+	defer cursor.Close(discoverCtx)
+
+	seen := make(map[BSONType]bool)
+	var types []BSONType
+	for cursor.Next(discoverCtx) {
+		var res struct {
+			Type string `bson:"_id"`
+		}
+		if err := cursor.Decode(&res); err != nil {
+			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
+		}
+
+		typeName := res.Type
+		switch typeName {
+		case "int", "long", "double", "decimal":
+			typeName = "number"
+		}
+		bType := BSONType(typeName)
+		if !seen[bType] {
+			seen[bType] = true
+			types = append(types, bType)
+		}
+	}
+
+	return types, cursor.Err()
 }
 
 // processBatch processes a batch of documents
