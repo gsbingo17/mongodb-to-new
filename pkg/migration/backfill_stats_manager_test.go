@@ -21,11 +21,11 @@ func TestBackfillStatsManager(t *testing.T) {
 	sm.Start(ctx)
 
 	// Record some reads
-	sm.RecordRead(10*time.Millisecond, 500)
-	sm.RecordRead(20*time.Millisecond, 1500) // 1.5 KB
-	sm.RecordRead(100*time.Millisecond, 10240) // 10 KB
+	sm.RecordRead("shop.orders", 10*time.Millisecond, 500)
+	sm.RecordRead("shop.orders", 20*time.Millisecond, 1500) // 1.5 KB
+	sm.RecordRead("shop.orders", 100*time.Millisecond, 10240) // 10 KB
 
-	sm.AddTargetCount(10)
+	sm.AddTargetCount("shop.orders", 10)
 	sm.RecordIngestQueueStall(100 * time.Millisecond)
 
 	// Record worker received
@@ -33,8 +33,18 @@ func TestBackfillStatsManager(t *testing.T) {
 
 	// Record some writes
 	sm.RecordBulkWrite(50 * time.Millisecond)
-	sm.RecordWriteResult(2, 1, 1, 1, 0)
+	sm.RecordWriteResult("shop.orders", 2, 1, 1, 1, 0)
 	sm.IncrementSequentialRetries("replace", 1)
+
+	// Per-namespace snapshot should carry the same numbers keyed by db.coll so
+	// the console can render one 全量 row per collection (not an aggregate).
+	nsSnap := sm.NamespaceBackfillSnapshot()
+	if len(nsSnap) != 1 || nsSnap[0].Namespace != "shop.orders" {
+		t.Fatalf("expected one per-namespace stat for shop.orders, got %+v", nsSnap)
+	}
+	if nsSnap[0].Target != 10 || nsSnap[0].Succeeded != 2 || nsSnap[0].Read != 3 {
+		t.Errorf("per-namespace counters wrong: %+v", nsSnap[0])
+	}
 
 	// Trigger manual stats report
 	sm.ReportStats(false)

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/assess"
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
@@ -225,6 +226,15 @@ func (d *EventDistributor) Start() error {
 		readerWg.Add(1)
 		go func(streamIndex int, changeStream *mongo.ChangeStream) {
 			defer readerWg.Done()
+			// Defense in depth: a panic in the mongo driver (e.g. Next racing a Close)
+			// must not take down the whole process. Recover, convert to a terminal
+			// error so the distributor unwinds cleanly, and let readerWg.Done() run.
+			defer func() {
+				if rec := recover(); rec != nil {
+					d.log.Errorf("[Reader %d] recovered from panic: %v", streamIndex, rec)
+					setError(fmt.Errorf("change stream reader %d panicked: %v", streamIndex, rec))
+				}
+			}()
 
 			for {
 				// Block on network socket until the next batch is fetched/returned by the driver
@@ -298,6 +308,18 @@ func (d *EventDistributor) Start() error {
 			}
 		}(idx, stream)
 	}
+
+	// Guarantee every reader goroutine has fully exited before Start returns.
+	// The caller closes the change streams via `defer stream.Close(ctx)` the moment
+	// Start returns; if a reader were still blocked in changeStream.Next(), that
+	// concurrent Close would race the mongo driver and segfault (nil cursor deref).
+	// Cancel first to unblock any in-flight Next, then wait for readers to drain.
+	// Registered after the reader loop so (LIFO) it runs BEFORE the worker-shutdown
+	// and top-level cancel defers — readers are gone before anything else tears down.
+	defer func() {
+		cancel()
+		readerWg.Wait()
+	}()
 
 	// Spin up cleanup supervisor to close the queue once all threads have terminated
 	go func() {
@@ -1131,15 +1153,24 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 
 // getTargetCollectionName gets the target collection name for a source collection
 func (w *Worker) getTargetCollectionName(dbName, collName string) string {
-	// Check if we have a mapping for this collection
+	// Base target name: an explicit mapping wins, else the source name.
+	target := collName
 	if w.collectionConfigs[dbName] != nil {
 		if collConfig, exists := w.collectionConfigs[dbName][collName]; exists {
-			return collConfig.TargetCollection
+			target = collConfig.TargetCollection
 		}
 	}
-
-	// If no mapping exists, use the same name
-	return collName
+	// Apply a rename-collection remediation (reserved __x__ → _x_) so writes land
+	// in the sanitized collection the assessment simulated. Keyed by the SOURCE
+	// name; a no-op when the target is already legal.
+	if w.transformer != nil {
+		renamed := w.transformer.SanitizeTargetName(dbName, collName, target)
+		if renamed != target {
+			recordCollectionRename(w.log.logger, dbName, collName, renamed)
+		}
+		target = renamed
+	}
+	return target
 }
 
 // isShutdownInProgress returns if a shutdown task is currently in progress thread-safely
@@ -1365,6 +1396,18 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 }
 
 func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error) {
+	// A delete whose _id cannot be represented in Firestore (e.g. a string _id over
+	// 1500 bytes, or a reserved __x__ name) targets a document that could never have
+	// been written to Firestore in the first place — its own insert would have failed
+	// identically. The delete is therefore a vacuous no-op that will fail against the
+	// target forever, pinning a permanent DLQ warning that no source fix can clear.
+	// Treat it as resolved instead: mark the op successful so the group's resolution
+	// pass writes a tombstone for any prior failure of this same _id.
+	if op.OpType == "delete" && idUnrepresentableInFirestore(op.DocumentID) {
+		w.log.Infof("[%s.%s] Delete of Firestore-unrepresentable _id=%v cannot apply to target (doc could never exist there); recording as resolved instead of DLQ", dbName, collName, op.DocumentID)
+		op.SuccessTime = time.Now()
+		return
+	}
 	if w.dlq != nil {
 		w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document, op.EventTime)
 	}
@@ -1380,6 +1423,19 @@ func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error)
 		}
 		w.activeFailedMu.Unlock()
 	}
+}
+
+// idUnrepresentableInFirestore reports whether an _id value can never be stored in
+// Firestore under any transform — i.e. it trips a blocking (not auto-fixable) ID
+// rule such as id-length (>1500 bytes) or id-reserved (__x__). Reuses the same
+// assessment rules the pre-migration checker uses, so the two can never drift.
+func idUnrepresentableInFirestore(id interface{}) bool {
+	for _, f := range assess.CheckID(id) {
+		if f.Severity == assess.SeverityBlock {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Worker) handleTransformationFailure(op *WriteOperation, dbName, collName string, err error) {

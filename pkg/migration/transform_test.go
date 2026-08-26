@@ -3,10 +3,12 @@ package migration
 import (
 	"encoding/json"
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/gsbingo17/mongodb-migration/pkg/idmap"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -799,7 +801,7 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{originalID: int32(456), expectedID: "_converted:int32:456", expectedType: "int32"},
 			{originalID: float64(12.34), expectedID: "_converted:double:12.34", expectedType: "float64"},
 			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
-			{originalID: bson.D{{"x", "y"}}, expectedID: "_converted:document:[{\"Key\":\"x\",\"Value\":\"y\"}]", expectedType: "primitive.D"},
+			{originalID: bson.D{{Key: "x", Value: "y"}}, expectedID: "_converted:document:[{\"Key\":\"x\",\"Value\":\"y\"}]", expectedType: "primitive.D"},
 		}
 
 		for _, tc := range cases {
@@ -915,6 +917,66 @@ func TestToComparableIDKey(t *testing.T) {
 			t.Fatalf("collision detected between type %s and %s: key=%s", typeName, origType, key)
 		}
 		seen[key] = typeName
+	}
+}
+
+// TestProactiveIDConversionRecordsIDMap proves the id-map wiring end to end:
+// when a shared id-map store is installed, a proactive _id conversion is
+// persisted so -mode=verify can reconnect the rewritten target document to its
+// source _id. The mapping must be keyed by the SOURCE collection name and by the
+// original typed value (the same key verify's mapper.Lookup uses).
+func TestProactiveIDConversionRecordsIDMap(t *testing.T) {
+	log := logger.New()
+
+	store, err := idmap.OpenFileStore(filepath.Join(t.TempDir(), "id-mapping.jsonl"))
+	if err != nil {
+		t.Fatalf("OpenFileStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// Install the shared store, then build the transformer so it captures it.
+	// Always restore the no-op sink so other tests are unaffected.
+	SetSharedIDStore(store)
+	defer SetSharedIDStore(idmap.NopStore{})
+	transformer := NewFieldTransformer(false, false, true, log)
+
+	origID := primitive.Binary{Subtype: 0x00, Data: []byte{0xDE, 0xAD, 0xBE, 0xEF}}
+	res, err := transformer.Transform(bson.M{"_id": origID, "n": 1}, "db", "orders", "id")
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
+	}
+	newID := res.(bson.M)["_id"].(string)
+	if newID != "_converted:binary:deadbeef" {
+		t.Fatalf("unexpected converted _id: %q", newID)
+	}
+
+	// Lookup exactly as verify does: by source collection name + original value.
+	got, ok := store.Lookup("orders", origID)
+	if !ok {
+		t.Fatalf("mapping not recorded for source collection %q", "orders")
+	}
+	if got != newID {
+		t.Errorf("id-map returned %q, want %q", got, newID)
+	}
+
+	// A different collection must not resolve the same original _id.
+	if _, ok := store.Lookup("customers", origID); ok {
+		t.Errorf("mapping leaked across collections")
+	}
+}
+
+// TestProactiveIDConversionNoStoreByDefault confirms the default sink is a no-op:
+// a transformer built without a shared store still converts, but records nothing
+// (and never panics), so existing paths and tests are unaffected.
+func TestProactiveIDConversionNoStoreByDefault(t *testing.T) {
+	SetSharedIDStore(idmap.NopStore{}) // explicit default
+	transformer := NewFieldTransformer(false, false, true, logger.New())
+	res, err := transformer.Transform(bson.M{"_id": int32(7)}, "db", "coll", "id")
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
+	}
+	if got := res.(bson.M)["_id"].(string); got != "_converted:int32:7" {
+		t.Fatalf("unexpected converted _id: %q", got)
 	}
 }
 

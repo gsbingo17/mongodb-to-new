@@ -1,0 +1,60 @@
+{
+  "_comment": "多库对 MongoDB -> Firestore(MongoDB 兼容) 全量+增量迁移示例。复制为 mongodb_full_migration_config.json 后，把下面所有占位符替换成你自己的连接串。切勿把含真实凭据的文件提交进 git —— .gitignore 已忽略 mongodb_full_migration_config.json。",
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://<USER>:<PASSWORD>@<HOST>:27017/?authSource=admin&replicaSet=<RS_NAME>",
+        "database": "source_db_1",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://<USER>:<PASSWORD>@<UID>.<LOCATION>.firestore.goog:443/<FIRESTORE_DB_ID>?loadBalanced=true&tls=true&authMechanism=SCRAM-SHA-256&retryWrites=false",
+        "database": "<FIRESTORE_DB_ID>",
+        "syncAllIndexes": true
+      }
+    },
+    {
+      "source": {
+        "connectionString": "mongodb://<USER>:<PASSWORD>@<HOST>:27017/?authSource=admin&replicaSet=<RS_NAME>",
+        "database": "source_db_2",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://<USER>:<PASSWORD>@<UID>.<LOCATION>.firestore.goog:443/<FIRESTORE_DB_ID_2>?loadBalanced=true&tls=true&authMechanism=SCRAM-SHA-256&retryWrites=false",
+        "database": "<FIRESTORE_DB_ID_2>",
+        "syncAllIndexes": true
+      }
+    }
+  ],
+  "saveThreshold": 1000,
+  "checkpointInterval": 5,
+  "forceOrderedOperations": false,
+  "flushIntervalMs": 500,
+
+  "initialReadBatchSize": 8192,
+  "initialWriteBatchSize": 128,
+  "initialChannelBufferSize": 10,
+  "initialMigrationWorkers": 5,
+  "concurrentCollections": 4,
+
+  "incrementalReadBatchSize": 8192,
+  "incrementalWriteBatchSize": 128,
+  "incrementalWorkerCount": 8,
+  "statsIntervalMinutes": 5,
+
+  "parallelReadsEnabled": true,
+  "maxReadPartitions": 8,
+  "minDocsPerPartition": 10000,
+  "minDocsForParallelReads": 50000,
+  "sampleSize": 1000,
+  "workersPerPartition": 3,
+
+  "retryConfig": {
+    "maxRetries": 5,
+    "baseDelayMs": 100,
+    "maxDelayMs": 5000,
+    "enableBatchSplitting": true,
+    "minBatchSize": 10,
+    "convertInvalidIds": true
+  }
+}

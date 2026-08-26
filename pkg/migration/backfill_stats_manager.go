@@ -59,9 +59,37 @@ type BackfillStatsManager struct {
 	// Ingestion backpressure
 	ingestQueueStallNs int64
 
+	// Per-namespace backfill counters (console per-collection 全量 rows). The
+	// aggregate atomics above drive the throughput log lines; the console needs
+	// the same numbers split per "db.coll" so the operator sees per-collection
+	// full-load progress instead of a single "全量汇总" aggregate row. Recorded at
+	// the same choke points as the aggregate counters (AddTargetCount / RecordRead
+	// / RecordWriteResult), keyed by namespace. Mirrors the incremental path's
+	// per-namespace tracking.
+	nsMu    sync.Mutex
+	nsStats map[string]*backfillNsCounter
+
 	// Write Throttler (optional reference for stats reporting)
 	throttler *WriteThrottler
 	dlq       DLQ
+}
+
+// backfillNsCounter holds cumulative per-namespace backfill counts for the
+// console. succeeded mirrors the aggregate successCount (documents written), so
+// the per-collection progress bar matches the overall one.
+type backfillNsCounter struct {
+	target    int64
+	succeeded int64
+	read      int64
+}
+
+// NsBackfillStat is a snapshot of one namespace's cumulative backfill counters,
+// consumed by the console observer to emit per-collection 全量 (initial) rows.
+type NsBackfillStat struct {
+	Namespace string // "db.coll"
+	Target    int64
+	Succeeded int64
+	Read      int64
 }
 
 // NewBackfillStatsManager creates a new BackfillStatsManager
@@ -73,6 +101,7 @@ func NewBackfillStatsManager(log *logger.Logger, interval time.Duration, incStat
 		startTime:     now,
 		lastStatsTime: now,
 		incStats:      incStats,
+		nsStats:       make(map[string]*backfillNsCounter),
 	}
 }
 
@@ -126,10 +155,28 @@ func (sm *BackfillStatsManager) Stop() {
 	sm.stopped.Store(true)
 }
 
-// RecordRead records metrics for a document fetched from the source database cursor.
-func (sm *BackfillStatsManager) RecordRead(latency time.Duration, sizeBytes int) {
+// nsCounterFor returns the per-namespace counter for namespace, creating it on
+// first use. The caller must hold sm.nsMu.
+func (sm *BackfillStatsManager) nsCounterFor(namespace string) *backfillNsCounter {
+	c := sm.nsStats[namespace]
+	if c == nil {
+		c = &backfillNsCounter{}
+		sm.nsStats[namespace] = c
+	}
+	return c
+}
+
+// RecordRead records metrics for a document fetched from the source database
+// cursor. namespace is the source "db.coll" the document was read from (empty is
+// tolerated: only the aggregate counters update).
+func (sm *BackfillStatsManager) RecordRead(namespace string, latency time.Duration, sizeBytes int) {
 	if sm == nil {
 		return
+	}
+	if namespace != "" {
+		sm.nsMu.Lock()
+		sm.nsCounterFor(namespace).read++
+		sm.nsMu.Unlock()
 	}
 	atomic.AddInt64(&sm.readCount, 1)
 	atomic.AddInt64(&sm.totalReadLatencyNs, int64(latency))
@@ -159,10 +206,18 @@ func (sm *BackfillStatsManager) RecordWorkerReceived(count int64) {
 	atomic.AddInt64(&sm.workerReceived, count)
 }
 
-// RecordWriteResult records document write result counts.
-func (sm *BackfillStatsManager) RecordWriteResult(succeeded, failed, duplicates, dlq int64, workerID int) {
+// RecordWriteResult records document write result counts. namespace is the
+// source "db.coll" the batch belongs to (empty is tolerated: only the aggregate
+// counters update). Only succeeded is tracked per-namespace, mirroring the
+// aggregate successCount the console progress bar reflects.
+func (sm *BackfillStatsManager) RecordWriteResult(namespace string, succeeded, failed, duplicates, dlq int64, workerID int) {
 	if sm == nil {
 		return
+	}
+	if namespace != "" && succeeded != 0 {
+		sm.nsMu.Lock()
+		sm.nsCounterFor(namespace).succeeded += succeeded
+		sm.nsMu.Unlock()
 	}
 	atomic.AddInt64(&sm.successCount, succeeded)
 	atomic.AddInt64(&sm.failedCount, failed)
@@ -219,11 +274,60 @@ func (sm *BackfillStatsManager) IncrementSequentialRetries(opType string, count 
 }
 
 // AddTargetCount increases the expected total document count of the backfill.
-func (sm *BackfillStatsManager) AddTargetCount(count int64) {
+// namespace is the source "db.coll" the count belongs to (empty is tolerated:
+// only the aggregate target updates). Called once per collection at the start of
+// its load, so the per-namespace target is known before writes begin.
+func (sm *BackfillStatsManager) AddTargetCount(namespace string, count int64) {
 	if sm == nil {
 		return
 	}
+	if namespace != "" {
+		sm.nsMu.Lock()
+		sm.nsCounterFor(namespace).target += count
+		sm.nsMu.Unlock()
+	}
 	atomic.AddInt64(&sm.targetCount, count)
+}
+
+// ProgressSnapshot returns a consistent read of backfill progress for external
+// observers (the web console). targetCount is the number of documents scheduled
+// for migration (0 until counting completes), succeeded is the number written so
+// far, read is the number fetched from the source, and elapsed is time since the
+// manager started. All reads are atomic; safe to call concurrently.
+func (sm *BackfillStatsManager) ProgressSnapshot() (targetCount, succeeded, read int64, elapsed time.Duration) {
+	if sm == nil {
+		return 0, 0, 0, 0
+	}
+	targetCount = atomic.LoadInt64(&sm.targetCount)
+	succeeded = atomic.LoadInt64(&sm.successCount)
+	read = atomic.LoadInt64(&sm.readCount)
+	// startTime is set once at construction and never mutated, so it is safe to
+	// read without the mutex.
+	if !sm.startTime.IsZero() {
+		elapsed = time.Since(sm.startTime)
+	}
+	return targetCount, succeeded, read, elapsed
+}
+
+// NamespaceBackfillSnapshot returns a copy of the per-namespace backfill counters
+// for the console. Cheap; called every ~2s by the observer poll loop to emit one
+// 全量 (initial) row per collection.
+func (sm *BackfillStatsManager) NamespaceBackfillSnapshot() []NsBackfillStat {
+	if sm == nil {
+		return nil
+	}
+	sm.nsMu.Lock()
+	defer sm.nsMu.Unlock()
+	out := make([]NsBackfillStat, 0, len(sm.nsStats))
+	for ns, c := range sm.nsStats {
+		out = append(out, NsBackfillStat{
+			Namespace: ns,
+			Target:    c.target,
+			Succeeded: c.succeeded,
+			Read:      c.read,
+		})
+	}
+	return out
 }
 
 // RecordIngestQueueStall records time spent waiting for worker channels to accept batches.

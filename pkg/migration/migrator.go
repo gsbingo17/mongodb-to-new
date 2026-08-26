@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,9 @@ import (
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
+	"github.com/gsbingo17/mongodb-migration/pkg/idmap"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"github.com/gsbingo17/mongodb-migration/pkg/metrics"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -30,6 +33,20 @@ type Migrator struct {
 	DryRun        bool
 	isLive        bool
 	CheckpointDir string
+
+	// Control plane (optional; wired by the web console via AttachControlPlane).
+	// When nil the migrator behaves exactly as the CLI. See observer.go.
+	reg     *metrics.Registry
+	control *metrics.Control
+	jobID   string
+
+	// cfgMu guards the runtime-mutable slice of config (partition knobs, per-collection
+	// tuning, ConcurrentCollections) so the console can hot-update them mid-run
+	// (Reconfig) while dispatch goroutines read them via effectivePartitioning.
+	cfgMu sync.RWMutex
+	// collSem, when set by the change-stream backfill dispatcher, caps how many
+	// collections load at once and can be resized live via Reconfig. nil in CLI mode.
+	collSem *resizableSem
 }
 
 // getCheckpointDir returns the configured checkpoint directory, defaulting to current directory if unset.
@@ -57,6 +74,16 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', 'retry-dlq', or 'capture-resume-token'", mode)
 	}
 
+	// When driven by the web console, translate a cooperative Stop() into
+	// context cancellation so a user "停止" actually halts in-flight work. The
+	// console maps the resulting clean cancellation to a terminal state itself.
+	// No-op for the CLI.
+	if m.controlPlaneAttached() {
+		var cancel context.CancelFunc
+		ctx, cancel = m.watchStop(ctx)
+		defer cancel()
+	}
+
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
 
 	if mode == "capture-resume-token" {
@@ -77,6 +104,28 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		}
 	}
 
+	// When _id conversion is enabled, record every invalid-_id → string mapping
+	// to a shared id-map file so `-mode=verify` can reconcile a rewritten target
+	// document back to its source _id. One shared, mutex-guarded store per run;
+	// every FieldTransformer built afterwards picks it up automatically. Restored
+	// to a no-op on return so a later run/verify starts from a clean sink. Skipped
+	// on dry runs (no writes) — the file lives beside the run's checkpoints.
+	if m.config.RetryConfig.ConvertInvalidIds && !m.DryRun {
+		idMapPath := filepath.Join(m.getCheckpointDir(), "id-mapping.jsonl")
+		if store, err := idmap.OpenFileStore(idMapPath); err != nil {
+			m.log.Warnf("Could not open id-map %s (converted _ids will not be recorded for verify): %v", idMapPath, err)
+		} else {
+			SetSharedIDStore(store)
+			m.log.Infof("Recording _id conversions to %s for verification", idMapPath)
+			defer func() {
+				SetSharedIDStore(idmap.NopStore{})
+				if cerr := store.Close(); cerr != nil {
+					m.log.Warnf("Error closing id-map file: %v", cerr)
+				}
+			}()
+		}
+	}
+
 	if mode == "migrate" || mode == "retry-dlq" {
 		// Migrate mode: process each database pair sequentially
 		for i, pair := range m.config.DatabasePairs {
@@ -87,6 +136,7 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 					break
 				}
 				m.log.Errorf("Error processing database pair %d: %v", i+1, err)
+				m.reportPairError(pair.Source.Database, err)
 			}
 		}
 		if mode == "retry-dlq" {
@@ -111,6 +161,9 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 					m.log.Infof("Database pair %d stopped due to context cancellation", index+1)
 				} else {
 					m.log.Errorf("Error processing database pair %d: %v", index+1, err)
+					// Surface the failure in the console so the database doesn't
+					// silently disappear from the dashboard.
+					m.reportPairError(dbPair.Source.Database, err)
 				}
 			}
 		}(i, pair)
@@ -230,6 +283,11 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	}
 
 	liveOnly := mode == "live-only"
+	// full-only: a one-shot full migration with no incremental tailing. For
+	// oplog-legacy (pre-3.6) sources this is the ONLY way to do "migrate" mode,
+	// because the modern backfill driver can't connect to 3.0/3.2 at all. It is
+	// terminal — the legacy replicator stops right after the initial load.
+	fullOnly := mode == "migrate"
 
 	// Initialize shared stats tracking for this database pair
 	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
@@ -244,8 +302,32 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	defer cancelBackfillStats()
 	backfillStatsManager.Start(backfillStatsCtx)
 
-	// Check if this is legacy mode - if so, handle it separately
-	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
+	// oplog-legacy (pre-3.6) sources MUST use the mgo path for every mode: the
+	// modern driver can't even connect to MongoDB 3.0/3.2 (it reports wire
+	// version 3, the driver needs ≥6). That includes migrate (full-only) mode,
+	// which routes through the legacy replicator and simply stops after the
+	// initial load instead of tailing the oplog. The legacy replicator reports
+	// its own per-collection progress directly, so skip the generic console
+	// pollers for it in all these cases.
+	takesLegacyReplicator := pair.Source.ReplicationMethod == "oplog-legacy" &&
+		(mode == "live" || mode == "live-only" || mode == "migrate")
+
+	// When attached to the web console, mirror progress into the dashboard PER
+	// COLLECTION: one 全量 (initial) row per collection driven by the backfill
+	// manager, and — for live modes — one 增量 (live) row per collection driven by
+	// the incremental manager. Both pollers key rows by db.coll, never an
+	// aggregate-by-database summary. Cheap no-ops for the CLI. The second arg is a
+	// db fallback for namespaces without a "db." prefix; the third is unused.
+	if m.controlPlaneAttached() && !takesLegacyReplicator {
+		m.pollBackfill(backfillStatsCtx, pair.Source.Database, "", backfillStatsManager)
+		if mode == "live" || mode == "live-only" {
+			m.pollIncremental(backfillStatsCtx, pair.Source.Database, "", incrementalStatsManager)
+		}
+	}
+
+	// Check if this is a legacy source - if so, handle it separately (mgo path).
+	// Covers live, live-only AND migrate (full-only) against pre-3.6 sources.
+	if takesLegacyReplicator {
 		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
 		collections := pair.Target.Collections
 		if len(collections) == 0 {
@@ -272,7 +354,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 				return nil
 			}
 		}
-		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly)
+		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, fullOnly)
 	}
 
 	// Connect to source MongoDB (modern driver)
@@ -305,35 +387,25 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		}
 	}
 
-	// Sync indexes before data migration (if configured)
-	// For live mode, each replicator handles index sync during its own initial migration
-	if mode == "migrate" && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
-		// Configure index build concurrency before launching any async builds
+	// Index timing (migrate / full-only mode): indexes are built AFTER the data
+	// load completes (see below, after wg.Wait), never before — building them up
+	// front makes Firestore re-index on every inserted document and stalls the whole
+	// load. The only exception is IndexOnly mode, whose entire purpose is to create
+	// indexes. This matches the legacy full-only path and the live paths' deferred
+	// build (all share the same "after load" rule via DeferredIndexController).
+	if mode == "migrate" && pair.Target.IndexOnly {
+		m.log.Info("IndexOnly mode enabled. Syncing indexes, then skipping data migration.")
 		if m.config.IndexConcurrency > 0 {
 			targetDB.SetIndexConcurrency(m.config.IndexConcurrency)
 		}
-
 		if err := m.syncIndexes(ctx, sourceDB, targetDB, pair, collections); err != nil {
-			m.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
-			// Continue with migration even if index sync has issues
+			m.log.Warnf("Index sync encountered issues: %v", err)
 		}
-
-		// Index-Only mode: wait for all async index builds then return without migrating data
-		if pair.Target.IndexOnly {
-			m.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
-			targetDB.WaitForIndexCreation()
-			m.logFailedIndexes(targetDB)
-			m.log.Info("IndexOnly mode: all indexes synced. Skipping data migration.")
-			return nil
-		}
-
-		// Wait for all async index creation to complete before starting data migration
-		// This prevents "schema change" errors from Firestore when indexes are being built
-		// concurrently with data writes
-		m.log.Info("Waiting for all async index creation to complete before starting data migration...")
+		m.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 		targetDB.WaitForIndexCreation()
 		m.logFailedIndexes(targetDB)
-		m.log.Info("All indexes created. Proceeding with data migration.")
+		m.log.Info("IndexOnly mode: all indexes synced. Skipping data migration.")
+		return nil
 	}
 
 	// Process each collection
@@ -390,6 +462,20 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		wg.Wait()
 		backfillStatsManager.ReportStats(true)
 		backfillStatsManager.Stop()
+
+		// Build indexes now that the one-shot full load is complete — never before
+		// (see the index-timing note above). Synchronous: this terminal job must not
+		// report done until its indexes exist. Skipped on interruption so we don't
+		// index a partially-loaded collection. Shared controller keeps the "after
+		// load" rule single-source across every path.
+		if ctx.Err() == nil {
+			deferredIdx := NewDeferredIndexController(m, targetDB, m.config, m.log, func(ctx context.Context) {
+				if err := m.syncIndexes(ctx, sourceDB, targetDB, pair, collections); err != nil {
+					m.log.Warnf("Index sync encountered issues: %v", err)
+				}
+			})
+			deferredIdx.BuildNow(ctx)
+		}
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
 		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, incrementalStatsManager, backfillStatsManager); err != nil {
@@ -469,9 +555,13 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 		if err := BackupAndClearDLQ(dlqPath, m.log); err != nil {
 			return fmt.Errorf("failed to backup and clear DLQ: %w", err)
 		}
-	} else {
-		if initialMigrationState.Status == StatusCompletedWithFailures {
-			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+	} else if initialMigrationState.Status == StatusCompletedWithFailures {
+		reset, gerr := m.resolveCompletedWithFailures(initialMigrationStatePath, dlqPath, pair.Source.Database)
+		if gerr != nil {
+			return gerr
+		}
+		if reset {
+			initialMigrationState = nil
 		}
 	}
 
@@ -496,6 +586,38 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 
 	// Start client-level replication (which will handle index sync during initial migration)
 	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
+}
+
+// resolveCompletedWithFailures decides what to do when a pair's initial
+// migration state is marked completed_with_failures before starting incremental
+// replication.
+//
+//   - If the DLQ still holds active failed records, those are genuine,
+//     retryable per-document failures: block so the operator reprocesses them
+//     (DLQ retry) or clears the queue first. This protects data integrity.
+//   - If the DLQ has NO active records, the marker is stale/inconsistent —
+//     typically from an earlier run that was interrupted (context cancelled),
+//     whose un-migrated remainder was counted as "failed" but never DLQ'd.
+//     Permanently banning the whole database in that case leaves no recovery
+//     path, so instead reset the state (and clear any residual DLQ) and report
+//     reset=true so the caller re-runs the initial migration cleanly.
+func (m *Migrator) resolveCompletedWithFailures(statePath, dlqPath, sourceDB string) (reset bool, err error) {
+	hasFailed, err := HasActiveFailedRecords(dlqPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to check DLQ status: %w", err)
+	}
+	if hasFailed {
+		return false, fmt.Errorf("cannot start incremental replication for %q: the previous initial migration left failed documents in the dead letter queue (%s). Reprocess them with DLQ retry (or clear the queue) before continuing", sourceDB, dlqPath)
+	}
+	m.log.Warnf("Database %q is marked completed_with_failures but its DLQ (%s) has no active records — this is a stale/interrupted state, not real failures. Resetting it and re-running the initial migration instead of blocking the database.",
+		sourceDB, dlqPath)
+	if err := DeleteInitialMigrationState(statePath); err != nil {
+		return false, fmt.Errorf("failed to reset stale initial migration state: %w", err)
+	}
+	if err := BackupAndClearDLQ(dlqPath, m.log); err != nil {
+		return false, fmt.Errorf("failed to backup and clear DLQ: %w", err)
+	}
+	return true, nil
 }
 
 // startOplogReplication starts replication using oplog tailing
@@ -540,9 +662,13 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 		if err := BackupAndClearDLQ(dlqPath, m.log); err != nil {
 			return fmt.Errorf("failed to backup and clear DLQ: %w", err)
 		}
-	} else {
-		if initialMigrationState.Status == StatusCompletedWithFailures {
-			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+	} else if initialMigrationState.Status == StatusCompletedWithFailures {
+		reset, gerr := m.resolveCompletedWithFailures(initialMigrationStatePath, dlqPath, pair.Source.Database)
+		if gerr != nil {
+			return gerr
+		}
+		if reset {
+			initialMigrationState = nil
 		}
 	}
 
@@ -564,8 +690,11 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 }
 
 // startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
-func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
+func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, fullOnly bool) error {
 	m.log.Info("Starting legacy oplog-based replication (using mgo driver for MongoDB 3.0/3.2)")
+	if fullOnly {
+		m.log.Warnf("Full-only (migrate) mode for %s: this is a ONE-SHOT full copy — no oplog tailing. Writes made to the source during/after the scan will NOT be migrated. Use live mode if you need those.", pair.Source.Database)
+	}
 
 	// Connect to source MongoDB using legacy driver (mgo)
 	m.log.Infof("Connecting to source MongoDB (legacy) at %s", pair.Source.ConnectionString)
@@ -628,9 +757,13 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 		if hasFailed {
 			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
 		}
-	} else {
-		if initialMigrationState.Status == StatusCompletedWithFailures {
-			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+	} else if initialMigrationState.Status == StatusCompletedWithFailures {
+		reset, gerr := m.resolveCompletedWithFailures(initialMigrationStatePath, dlqPath, pair.Source.Database)
+		if gerr != nil {
+			return gerr
+		}
+		if reset {
+			initialMigrationState = nil
 		}
 	}
 
@@ -648,7 +781,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, fullOnly, m.LiveStartTime, m)
 }
 
 // getCollectionsToProcess determines which collections to process
@@ -694,11 +827,59 @@ type backfillBatchItem struct {
 	seq   uint64
 }
 
+// effectivePartitioning returns the partitioned-load knobs for one source
+// collection: the per-collection override where set (config's
+// TargetConfig.CollectionTuning, keyed by source collection name), otherwise the
+// global config value. dbName is the SOURCE database name. This is the single
+// resolution point so whole-database and explicit-collection modes behave
+// identically, and only the partition levers are per-collection.
+func (m *Migrator) effectivePartitioning(dbName, collName string) (parallelEnabled bool, maxParts, workersPerPart, minDocsPerPart, minDocsForParallel int) {
+	// Read under RLock so a concurrent console Reconfig (write lock) sees a
+	// consistent snapshot of the global knobs + per-collection tuning map.
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+
+	parallelEnabled = m.config.ParallelReadsEnabled
+	maxParts = m.config.MaxReadPartitions
+	workersPerPart = m.config.WorkersPerPartition
+	minDocsPerPart = m.config.MinDocsPerPartition
+	minDocsForParallel = m.config.MinDocsForParallelReads
+
+	for i := range m.config.DatabasePairs {
+		p := &m.config.DatabasePairs[i]
+		if p.Source.Database != dbName {
+			continue
+		}
+		if ov, ok := p.Target.CollectionTuning[collName]; ok {
+			if ov.ParallelReadsEnabled != nil {
+				parallelEnabled = *ov.ParallelReadsEnabled
+			}
+			if ov.MaxReadPartitions > 0 {
+				maxParts = ov.MaxReadPartitions
+			}
+			if ov.WorkersPerPartition > 0 {
+				workersPerPart = ov.WorkersPerPartition
+			}
+			if ov.MinDocsPerPartition > 0 {
+				minDocsPerPart = ov.MinDocsPerPartition
+			}
+			if ov.MinDocsForParallelReads > 0 {
+				minDocsForParallel = ov.MinDocsForParallelReads
+			}
+		}
+		break // the pair for this source db is found; stop scanning
+	}
+	return
+}
+
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
 func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig, opts MigrateOptions) (int64, int64, error) {
 	// Get source and target collections
 	sourceCollection := sourceDB.GetCollection(collConfig.SourceCollection)
 	targetCollection := targetDB.GetCollection(collConfig.TargetCollection)
+
+	// Source namespace ("db.coll") for per-collection backfill progress rows.
+	bfNS := sourceDB.GetDatabaseName() + "." + collConfig.SourceCollection
 
 	m.log.Infof("Migrating collection: %s.%s to %s.%s", sourceDB.GetDatabaseName(), collConfig.SourceCollection, targetDB.GetDatabaseName(), collConfig.TargetCollection)
 
@@ -731,7 +912,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	if opts.BackfillStatsManager != nil {
-		opts.BackfillStatsManager.AddTargetCount(totalCount)
+		opts.BackfillStatsManager.AddTargetCount(bfNS, totalCount)
 	}
 
 	// If no documents, we're done
@@ -740,8 +921,12 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		return 0, 0, nil
 	}
 
-	// Check if parallel reads are enabled and collection is large enough
-	if m.config.ParallelReadsEnabled && totalCount >= int64(m.config.MinDocsForParallelReads) {
+	// Check if parallel reads are enabled and collection is large enough. Both the
+	// enable flag and the size threshold honor any per-collection override, so a
+	// byte-heavy/low-count straggler can be partitioned even when the global
+	// threshold would leave it on a single cursor.
+	parallelEnabled, _, _, _, minDocsForParallel := m.effectivePartitioning(sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+	if parallelEnabled && totalCount >= int64(minDocsForParallel) {
 		m.log.Infof("Using parallel reads for large collection: %s (%d documents)", collConfig.SourceCollection, totalCount)
 		return m.migrateCollectionParallel(ctx, sourceDB, targetDB, collConfig, totalCount, opts)
 	}
@@ -1002,7 +1187,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		readDuration := time.Since(readStart)
 
 		if opts.BackfillStatsManager != nil {
-			opts.BackfillStatsManager.RecordRead(readDuration, len(cursor.Current))
+			opts.BackfillStatsManager.RecordRead(bfNS, readDuration, len(cursor.Current))
 		}
 
 		// Add to batch
@@ -1232,8 +1417,21 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 	checkpointDir := m.getCheckpointDir()
 
-	// Calculate optimal partition count
-	expectedPartitions := CalculatePartitionCount(totalCount, m.config.MinDocsPerPartition, m.config.MaxReadPartitions)
+	// Source namespace ("db.coll") for per-collection backfill progress rows.
+	bfNS := sourceDB.GetDatabaseName() + "." + collConfig.SourceCollection
+
+	// Resolve partition knobs with any per-collection override applied (the global
+	// value otherwise). Same resolution as the enable gate in migrateCollection.
+	// The actual partitioner is created inside the resample/fresh branches below;
+	// these effective values feed both those partitioners and expectedPartitions
+	// so the checkpoint arity stays consistent with a per-collection override.
+	_, maxParts, workersPerPart, minDocsPerPart, _ := m.effectivePartitioning(sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+
+	// Calculate optimal partition count. Use the per-collection effective knobs
+	// (not the global m.config.*) so the checkpoint set arity matches what the
+	// partitioner above actually produces — otherwise a per-collection override
+	// would force every resume onto the full-rescan path.
+	expectedPartitions := CalculatePartitionCount(totalCount, minDocsPerPart, maxParts)
 
 	// Evaluate backfill resumption plan for parallel migration
 	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, expectedPartitions)
@@ -1288,8 +1486,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		partitioner := NewCollectionPartitioner(
 			sourceCollection,
 			m.log,
-			m.config.MaxReadPartitions,
-			m.config.MinDocsPerPartition,
+			maxParts,
+			minDocsPerPart,
 			m.config.SampleSize,
 			m.config.IDTypeForPartition,
 		)
@@ -1336,8 +1534,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		partitioner := NewCollectionPartitioner(
 			sourceCollection,
 			m.log,
-			m.config.MaxReadPartitions,
-			m.config.MinDocsPerPartition,
+			maxParts,
+			minDocsPerPart,
 			m.config.SampleSize,
 			m.config.IDTypeForPartition,
 		)
@@ -1486,8 +1684,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			var partitionMigratedCount int64
 			var partitionMu sync.Mutex // Mutex for thread-safe updates to partitionMigratedCount
 
-			// Start worker pool for this partition
-			workerCount := m.config.WorkersPerPartition
+			// Start worker pool for this partition (per-collection override applied)
+			workerCount := workersPerPart
 			if workerCount < 1 {
 				workerCount = 1 // Ensure at least 1 worker per partition
 			}
@@ -1573,7 +1771,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				readDuration := time.Since(readStart)
 
 				if opts.BackfillStatsManager != nil {
-					opts.BackfillStatsManager.RecordRead(readDuration, len(cursor.Current))
+					opts.BackfillStatsManager.RecordRead(bfNS, readDuration, len(cursor.Current))
 				}
 
 				// Add to batch
@@ -1718,6 +1916,21 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 
 	var indexCount int
 
+	// Always create the _id index on every target collection, independent of
+	// SyncAllIndexes. Firestore does NOT auto-create it (real MongoDB does), so
+	// without this there is no index backing _id lookups/ordering. Idempotent:
+	// skipped when the target already has "_id_".
+	for _, collConfig := range collections {
+		targetCollName := collConfig.TargetCollection
+		if m.targetHasIndex(ctx, targetDB, targetCollName, "_id_") {
+			m.log.Infof("_id index already exists on target collection '%s', skipping", targetCollName)
+			continue
+		}
+		m.log.Infof("Launching async _id index creation on target collection '%s'", targetCollName)
+		targetDB.CreateIDIndexAsync(pair.Target.ConnectionString, targetCollName)
+		indexCount++
+	}
+
 	if pair.Target.SyncAllIndexes {
 		// Auto-sync all indexes for every migrated collection
 		m.log.Info("SyncAllIndexes enabled: syncing all indexes (excluding _id_) for all collections")
@@ -1839,6 +2052,22 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 	return nil
 }
 
+// targetHasIndex reports whether the target collection already has an index with
+// the given name. Errors (e.g. collection not yet created) are treated as "no",
+// so the caller attempts creation. Used to keep index creation idempotent.
+func (m *Migrator) targetHasIndex(ctx context.Context, targetDB *db.MongoDB, collection, indexName string) bool {
+	idxs, err := targetDB.ListIndexes(ctx, collection)
+	if err != nil {
+		return false
+	}
+	for _, idx := range idxs {
+		if n, ok := idx["name"].(string); ok && n == indexName {
+			return true
+		}
+	}
+	return false
+}
+
 // getTargetCollectionName gets the target collection name for a source collection
 func (m *Migrator) getTargetCollectionName(sourceCollName string, pair config.DatabasePair) string {
 	// Search through collections configuration for explicit mapping
@@ -1879,6 +2108,9 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 	convertInvalidIds := m.config.RetryConfig.ConvertInvalidIds && m.isLive
 	transformer := NewFieldTransformer(m.config.DropEmptyFieldNames, m.config.ConvertLongFieldNamesInNestedDocs, convertInvalidIds, m.log)
 
+	// Source namespace ("db.coll") for per-collection backfill progress rows.
+	bfNS := sourceDB + "." + sourceCollection
+
 	writeStart := time.Now()
 
 	if opts.DLQ != nil {
@@ -1896,7 +2128,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 			writeDuration := time.Since(writeStart)
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-				opts.BackfillStatsManager.RecordWriteResult(0, int64(len(batch)), 0, int64(len(batch)), workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS,0, int64(len(batch)), 0, int64(len(batch)), workerID)
 			}
 			return 0, int64(len(batch)), nil
 		}
@@ -1937,7 +2169,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 						duplicateKeys = int64(len(batch))
 						m.log.Debugf("[%s.%s] Proactively skipped entire batch of %d documents (already exist)", sourceDB, sourceCollection, len(batch))
 						if opts.BackfillStatsManager != nil {
-							opts.BackfillStatsManager.RecordWriteResult(0, 0, duplicateKeys, 0, workerID)
+							opts.BackfillStatsManager.RecordWriteResult(bfNS,0, 0, duplicateKeys, 0, workerID)
 						}
 						return 0, 0, nil
 					} else if len(existingKeys) > 0 {
@@ -1993,7 +2225,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		if insertErr == nil {
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(bulkDuration)
-				opts.BackfillStatsManager.RecordWriteResult(int64(len(batch)), 0, 0, 0, workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS,int64(len(batch)), 0, 0, 0, workerID)
 			}
 			return int64(len(batch)), 0, nil
 		}
@@ -2107,7 +2339,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 									proactiveSkipEnabled.Store(true)
 								}
 								if opts.BackfillStatsManager != nil {
-									opts.BackfillStatsManager.RecordWriteResult(successCount, 0, duplicateKeys, 0, workerID)
+									opts.BackfillStatsManager.RecordWriteResult(bfNS,successCount, 0, duplicateKeys, 0, workerID)
 								}
 								return successCount, 0, nil
 							}
@@ -2165,7 +2397,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 
 		successCount := int64(len(batch)) - batchFailed
 		if opts.BackfillStatsManager != nil {
-			opts.BackfillStatsManager.RecordWriteResult(successCount, batchFailed, duplicateKeys, dlqCount, workerID)
+			opts.BackfillStatsManager.RecordWriteResult(bfNS,successCount, batchFailed, duplicateKeys, dlqCount, workerID)
 		}
 		return successCount, batchFailed, nil
 	} else {
@@ -2187,13 +2419,13 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		if err != nil {
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-				opts.BackfillStatsManager.RecordWriteResult(0, int64(len(batch)), 0, 0, workerID)
+				opts.BackfillStatsManager.RecordWriteResult(bfNS,0, int64(len(batch)), 0, 0, workerID)
 			}
 			return 0, int64(len(batch)), err
 		}
 		if opts.BackfillStatsManager != nil {
 			opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
-			opts.BackfillStatsManager.RecordWriteResult(int64(len(batch)), 0, 0, 0, workerID)
+			opts.BackfillStatsManager.RecordWriteResult(bfNS,int64(len(batch)), 0, 0, 0, workerID)
 		}
 		return int64(len(batch)), 0, nil
 	}
@@ -2280,7 +2512,28 @@ func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, p
 		return targetDB.GetCollection(collectionName)
 	}
 
-	phase, failedCount, err := m.reprocessDLQLoop(ctx, tempPath, newDLQ, getCollection)
+	// Optional source-resync: when enabled, each failed document is re-read fresh
+	// from the SOURCE by _id (instead of replaying the stored DLQ snapshot), so a
+	// user who fixed the offending data at the source gets the corrected copy
+	// migrated. Source-deleted documents are treated as resolved. Snapshot replay
+	// remains the default. Legacy (oplog-legacy) sources use the mgo driver.
+	var sourceFetch sourceDocFetcher
+	if m.config != nil && m.config.RetryConfig.ResyncFromSource {
+		var closeSource func()
+		if pair.Source.ReplicationMethod == "oplog-legacy" {
+			m.log.Infof("DLQ retry: source-resync enabled — re-reading failed documents from legacy source %s (mgo driver)", pair.Source.Database)
+			sourceFetch, closeSource, err = newLegacySourceFetcher(pair.Source.ConnectionString, pair.Source.Database)
+		} else {
+			m.log.Infof("DLQ retry: source-resync enabled — re-reading failed documents from source %s", pair.Source.Database)
+			sourceFetch, closeSource, err = m.newModernSourceFetcher(ctx, pair.Source.ConnectionString, pair.Source.Database)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to connect to source MongoDB for DLQ source-resync: %w", err)
+		}
+		defer closeSource()
+	}
+
+	phase, failedCount, err := m.reprocessDLQLoop(ctx, tempPath, newDLQ, getCollection, sourceFetch)
 	if err != nil {
 		runErr = err
 		return runErr
@@ -2307,9 +2560,33 @@ func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, p
 	return nil
 }
 
+// newModernSourceFetcher opens a modern-driver connection to the source and
+// returns a sourceDocFetcher plus a close func, for retry-dlq source-resync
+// against MongoDB ≥ 3.6 / change-stream sources.
+func (m *Migrator) newModernSourceFetcher(ctx context.Context, connectionString, database string) (sourceDocFetcher, func(), error) {
+	src, err := db.NewMongoDB(connectionString, database, 1, 10, 0, nil, m.log)
+	if err != nil {
+		return nil, nil, err
+	}
+	fetch := func(collection string, id interface{}) (interface{}, bool, error) {
+		var doc bson.M
+		ferr := src.GetCollection(collection).FindOne(ctx, bson.M{"_id": id}).Decode(&doc)
+		if ferr == mongo.ErrNoDocuments {
+			return nil, false, nil
+		}
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		return doc, true, nil
+	}
+	return fetch, func() { _ = src.Close(ctx) }, nil
+}
+
 // reprocessDLQLoop processes records inside the DLQ temp file, writing them back to target using the getCollection helper.
 // It performs a chronological scan to de-duplicate updates and ignore resolved records, ensuring zero stale write overwrites.
-func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ *DLQWriter, getCollection func(string) TargetCollection) (phase string, failedCount int64, runErr error) {
+// When sourceFetch is non-nil (source-resync), each non-delete failure is re-read
+// fresh from the source by _id instead of replaying the stored snapshot.
+func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ *DLQWriter, getCollection func(string) TargetCollection, sourceFetch sourceDocFetcher) (phase string, failedCount int64, runErr error) {
 	file, err := os.Open(tempPath)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open temp DLQ file: %w", err)
@@ -2397,7 +2674,7 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 		}
 	}
 
-	var processed, succeeded, failed int64
+	var processed, succeeded, failed, resolved int64
 
 	// Pass 2: Execute Replays
 	for _, f := range failuresMap {
@@ -2409,6 +2686,15 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 		processed++
 		record := f.record
 
+		// Original change-event time, preserved on any re-failure so DLQ ordering
+		// stays chronologically correct across retries.
+		var eventTime time.Time
+		if record.EventTime != "" {
+			if t, err := time.Parse(time.RFC3339, record.EventTime); err == nil {
+				eventTime = t
+			}
+		}
+
 		m.log.Debugf("Retrying document [db=%s, collection=%s, id=%v, op=%s]",
 			record.SourceDB, record.SourceCollection, record.DocumentID, record.OpType)
 
@@ -2416,15 +2702,42 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 		var writeErr error
 
 		if record.OpType == "delete" {
+			// A delete replays the same way regardless of source-resync: the source
+			// already dropped this document, so we remove it from the target.
 			_, writeErr = targetColl.DeleteOne(ctx, bson.M{"_id": record.DocumentID})
 		} else { // insert, update, replace, mixed
-			var docToReplace interface{} = record.Document
-			if record.Document != nil {
-				transformed, err := transformer.Transform(record.Document, record.SourceDB, record.SourceCollection, record.DocumentID)
+			// Default: replay the stored snapshot. With source-resync, re-read the
+			// current document from the source so a source-side fix is picked up.
+			docSnapshot := record.Document
+			if sourceFetch != nil {
+				fresh, found, ferr := sourceFetch(record.SourceCollection, record.DocumentID)
+				if ferr != nil {
+					m.log.Errorf("DLQ retry (source-resync): failed to re-read document %v from source %s.%s: %v",
+						record.DocumentID, record.SourceDB, record.SourceCollection, ferr)
+					failed++
+					newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID,
+						fmt.Errorf("source-resync read failed: %w", ferr), record.Phase, record.OpType, record.Document, eventTime)
+					continue
+				}
+				if !found {
+					// The source no longer has this document — the user resolved the
+					// failure by deleting the offending source doc. Treat as resolved
+					// and skip; leave the target untouched.
+					m.log.Infof("DLQ retry (source-resync): document %v not found in source %s.%s (deleted) — treating as resolved and skipping.",
+						record.DocumentID, record.SourceDB, record.SourceCollection)
+					resolved++
+					continue
+				}
+				docSnapshot = fresh
+			}
+
+			var docToReplace interface{} = docSnapshot
+			if docSnapshot != nil {
+				transformed, err := transformer.Transform(docSnapshot, record.SourceDB, record.SourceCollection, record.DocumentID)
 				if err != nil {
 					m.log.Errorf("DLQ retry: Failed to transform document %v: %v", record.DocumentID, err)
 					failed++
-					newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, err, record.Phase, record.OpType, record.Document, time.Time{})
+					newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, err, record.Phase, record.OpType, docSnapshot, eventTime)
 					continue
 				}
 				docToReplace = transformed
@@ -2436,12 +2749,6 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 		if writeErr != nil {
 			m.log.Errorf("DLQ retry: Failed to write document %v to target: %v", record.DocumentID, writeErr)
 			failed++
-			var eventTime time.Time
-			if record.EventTime != "" {
-				if t, err := time.Parse(time.RFC3339, record.EventTime); err == nil {
-					eventTime = t
-				}
-			}
 			newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, writeErr, record.Phase, record.OpType, record.Document, eventTime)
 		} else {
 			m.log.Debugf("DLQ retry: Successfully recovered document %v", record.DocumentID)
@@ -2449,7 +2756,7 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 		}
 	}
 
-	m.log.Infof("DLQ reprocessing complete: processed %d, succeeded %d, failed %d", processed, succeeded, failed)
+	m.log.Infof("DLQ reprocessing complete: processed %d, succeeded %d, resolved(source-deleted) %d, failed %d", processed, succeeded, resolved, failed)
 	return expectedPhase, failed, nil
 }
 

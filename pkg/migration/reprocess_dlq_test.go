@@ -21,10 +21,12 @@ type mockTargetCollection struct {
 	replaceCount int
 	deleteCount  int
 	failReplace  bool
+	lastReplace  interface{} // captures the last replacement doc for assertions
 }
 
 func (m *mockTargetCollection) ReplaceOne(ctx context.Context, filter interface{}, replacement interface{}, opts ...*options.ReplaceOptions) (*mongo.UpdateResult, error) {
 	m.replaceCount++
+	m.lastReplace = replacement
 	if m.failReplace {
 		return nil, errors.New("mock write error")
 	}
@@ -65,7 +67,7 @@ func TestReprocessDLQLoopSuccess(t *testing.T) {
 	}
 
 	// Act
-	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection)
+	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, nil)
 	if err != nil {
 		t.Fatalf("expected reprocessDLQLoop to succeed, got: %v", err)
 	}
@@ -81,6 +83,80 @@ func TestReprocessDLQLoopSuccess(t *testing.T) {
 	// Verify new DLQ is empty (succeeded count is 2, active file count is 0)
 	if newDLQ.Count() != 0 {
 		t.Errorf("expected new DLQ count to be 0, got %d", newDLQ.Count())
+	}
+}
+
+// TestReprocessDLQLoopSourceResync exercises the source-resync path: found docs
+// are re-read fresh from the source and replayed, source-deleted docs are treated
+// as resolved (skipped, target untouched), and read errors keep the doc in the DLQ.
+func TestReprocessDLQLoopSourceResync(t *testing.T) {
+	log := logger.New()
+	m := NewMigrator(&config.Config{}, log)
+	tmpDir := t.TempDir()
+
+	tempFilePath := filepath.Join(tmpDir, "temp_dlq.jsonl")
+	newDlqFilePath := filepath.Join(tmpDir, "new_dlq.jsonl")
+
+	// Three failures, all initial/insert. The stored snapshots carry the ORIGINAL
+	// (bad) value; source-resync must ignore them and use the fetcher's fresh copy.
+	records := []string{
+		`{"sourceDB":"src","sourceCollection":"coll1","documentID":"idFound","error":"too big","phase":"initial","opType":"insert","timestamp":"2026-06-10T00:00:00Z","document":{"_id":"idFound","name":"OLD_BAD"}}`,
+		`{"sourceDB":"src","sourceCollection":"coll1","documentID":"idDeleted","error":"too big","phase":"initial","opType":"insert","timestamp":"2026-06-10T00:00:01Z","document":{"_id":"idDeleted","name":"OLD_BAD"}}`,
+		`{"sourceDB":"src","sourceCollection":"coll1","documentID":"idReadErr","error":"too big","phase":"initial","opType":"insert","timestamp":"2026-06-10T00:00:02Z","document":{"_id":"idReadErr","name":"OLD_BAD"}}`,
+	}
+	if err := os.WriteFile(tempFilePath, []byte(strings.Join(records, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write mock DLQ file: %v", err)
+	}
+
+	newDLQ, err := NewDLQWriter(newDlqFilePath, log)
+	if err != nil {
+		t.Fatalf("failed to create DLQWriter: %v", err)
+	}
+	defer newDLQ.Close()
+
+	mockColl := &mockTargetCollection{}
+	getCollection := func(collName string) TargetCollection { return mockColl }
+
+	// Fake source: idFound returns a FIXED fresh doc, idDeleted is gone, idReadErr errors.
+	sourceFetch := func(collection string, id interface{}) (interface{}, bool, error) {
+		switch id {
+		case "idFound":
+			return bson.M{"_id": "idFound", "name": "FIXED_FRESH"}, true, nil
+		case "idDeleted":
+			return nil, false, nil
+		case "idReadErr":
+			return nil, false, errors.New("source read boom")
+		}
+		return nil, false, nil
+	}
+
+	_, failed, err := m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, sourceFetch)
+	if err != nil {
+		t.Fatalf("expected reprocessDLQLoop to succeed, got: %v", err)
+	}
+
+	// Only idFound should have been written to the target (idDeleted skipped, idReadErr failed pre-write).
+	if mockColl.replaceCount != 1 {
+		t.Errorf("expected 1 ReplaceOne (idFound only), got %d", mockColl.replaceCount)
+	}
+	// The written doc must be the FRESH source copy, not the stored bad snapshot.
+	if repl, ok := mockColl.lastReplace.(map[string]interface{}); ok {
+		if repl["name"] != "FIXED_FRESH" {
+			t.Errorf("expected fresh source doc (name=FIXED_FRESH), got %v", repl["name"])
+		}
+	} else if repl, ok := mockColl.lastReplace.(bson.M); ok {
+		if repl["name"] != "FIXED_FRESH" {
+			t.Errorf("expected fresh source doc (name=FIXED_FRESH), got %v", repl["name"])
+		}
+	} else {
+		t.Errorf("unexpected replacement type %T: %v", mockColl.lastReplace, mockColl.lastReplace)
+	}
+	// idReadErr stays in the DLQ; idDeleted is resolved (not written).
+	if failed != 1 {
+		t.Errorf("expected failed count 1 (idReadErr), got %d", failed)
+	}
+	if newDLQ.Count() != 1 {
+		t.Errorf("expected new DLQ count 1 (idReadErr kept), got %d", newDLQ.Count())
 	}
 }
 
@@ -113,7 +189,7 @@ func TestReprocessDLQLoopPhaseMismatch(t *testing.T) {
 	}
 
 	// Act
-	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection)
+	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, nil)
 
 	// Assert: should fail due to safety violation
 	if err == nil {
@@ -166,7 +242,7 @@ func TestReprocessDLQLoopRecoveryOnCancellation(t *testing.T) {
 	}
 
 	// Act
-	_, _, err = m.reprocessDLQLoop(ctx, tempFilePath, newDLQ, getCollection)
+	_, _, err = m.reprocessDLQLoop(ctx, tempFilePath, newDLQ, getCollection, nil)
 	if err == nil {
 		t.Fatal("expected error due to context cancellation, got nil")
 	}
@@ -266,7 +342,7 @@ func TestReprocessDLQLoopUnmarshalError(t *testing.T) {
 	}
 
 	// Act
-	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection)
+	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, nil)
 
 	// Assert: should fail due to unmarshal error
 	if err == nil {
@@ -456,7 +532,7 @@ func TestReprocessDLQDeDuplicationAndChronology(t *testing.T) {
 	}
 
 	// Act
-	phase, failedCount, err := m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection)
+	phase, failedCount, err := m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, nil)
 	if err != nil {
 		t.Fatalf("expected reprocessDLQLoop to succeed, got: %v", err)
 	}
@@ -501,7 +577,7 @@ func TestReprocessDLQUnsupportedVersion(t *testing.T) {
 	}
 
 	// Act
-	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection)
+	_, _, err = m.reprocessDLQLoop(context.Background(), tempFilePath, newDLQ, getCollection, nil)
 	if err == nil {
 		t.Fatalf("expected reprocessDLQLoop to abort with error due to unsupported version v999, but it succeeded")
 	}
