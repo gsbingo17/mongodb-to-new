@@ -679,46 +679,17 @@ func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Contex
 	return mergeTypeSlices(slicesPerType, partitionCount), nil
 }
 
-// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field.
+// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field using DiscoverPresentBSONTypeCounts.
 func (p *CollectionPartitioner) discoverPresentBSONTypes(ctx context.Context) (map[string]int64, error) {
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
-			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
-		}}},
-	}
-
-	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-
-	cursor, err := p.sourceCollection.Aggregate(discoverCtx, pipeline)
+	counts, err := DiscoverPresentBSONTypeCounts(ctx, p.sourceCollection, 2000)
 	if err != nil {
-		return nil, fmt.Errorf("failed to aggregate BSON types: %w", err)
+		return nil, err
 	}
-	defer cursor.Close(discoverCtx)
-
-	typeCounts := make(map[string]int64)
-	for cursor.Next(discoverCtx) {
-		var res struct {
-			Type  string `bson:"_id"`
-			Count int64  `bson:"count"`
-		}
-		if err := cursor.Decode(&res); err != nil {
-			return nil, fmt.Errorf("failed to decode type discovery group: %w", err)
-		}
-
-		typeName := res.Type
-		switch typeName {
-		case "int", "long", "double", "decimal":
-			typeName = "number"
-		}
-		typeCounts[typeName] += res.Count
+	typeCounts := make(map[string]int64, len(counts))
+	for bType, cnt := range counts {
+		typeCounts[string(bType)] = cnt
+		p.log.Infof("Discovered present BSON type '%s' (sample count capped at 2000: %d)", bType, cnt)
 	}
-
-	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error during type discovery: %w", err)
-	}
-
 	return typeCounts, nil
 }
 

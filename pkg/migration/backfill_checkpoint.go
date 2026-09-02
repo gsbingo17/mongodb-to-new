@@ -13,6 +13,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // BSONType represents a canonical MongoDB BSON type name used for _id partitioning and filtering.
@@ -226,41 +227,58 @@ func GetBSONType(val any) BSONType {
 	}
 }
 
-// DiscoverPresentBSONTypes returns the unique canonical BSONTypes of the _id field present in the collection.
-func DiscoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
+// CandidateBSONTypes lists the candidate BSON types checked during _id type discovery.
+var CandidateBSONTypes = []BSONType{
+	BSONTypeObjectID,
+	BSONTypeString,
+	BSONTypeNumber,
+	BSONTypeDate,
+	BSONTypeBinary,
+	BSONTypeBool,
+	BSONTypeTimestamp,
+}
+
+// DiscoverPresentBSONTypeCounts probes candidate types using index-covered CountDocuments queries with a limit.
+func DiscoverPresentBSONTypeCounts(ctx context.Context, collection *mongo.Collection, limit int64) (map[BSONType]int64, error) {
 	if collection == nil {
 		return nil, fmt.Errorf("collection cannot be nil")
 	}
-
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
-		}}},
+	if limit <= 0 {
+		limit = 2000
 	}
 
-	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	countOpts := options.Count().SetLimit(limit)
+	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cursor, err := collection.Aggregate(discoverCtx, pipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
-	}
-	defer cursor.Close(discoverCtx)
+	typeCounts := make(map[BSONType]int64)
 
-	seen := make(map[BSONType]bool)
+	for _, bType := range CandidateBSONTypes {
+		filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: string(bType)}}}}
+		cnt, err := collection.CountDocuments(discoverCtx, filter, countOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to probe BSON type '%s': %w", bType, err)
+		}
+		if cnt > 0 {
+			typeCounts[bType] = cnt
+		}
+	}
+
+	return typeCounts, nil
+}
+
+// DiscoverPresentBSONTypes returns the unique canonical BSONTypes of the _id field present in the collection.
+func DiscoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
+	counts, err := DiscoverPresentBSONTypeCounts(ctx, collection, 1)
+	if err != nil {
+		return nil, err
+	}
+
 	var types []BSONType
-	for cursor.Next(discoverCtx) {
-		var res struct {
-			Type string `bson:"_id"`
-		}
-		if err := cursor.Decode(&res); err != nil {
-			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
-		}
-		if bType := ParseBSONType(res.Type); !seen[bType] {
-			seen[bType] = true
+	for _, bType := range CandidateBSONTypes {
+		if counts[bType] > 0 {
 			types = append(types, bType)
 		}
 	}
-
-	return types, cursor.Err()
+	return types, nil
 }
