@@ -1389,9 +1389,13 @@ func (w *Worker) handleTransformationFailure(op *WriteOperation, dbName, collNam
 
 // isDuplicateKeyError checks if a write error code or message represents a duplicate key/document already exists constraint failure.
 func isDuplicateKeyError(code int, msg string) bool {
-	return code == 11000 ||
-		strings.Contains(msg, "Document already exists") ||
-		strings.Contains(msg, "E11000")
+	if code == 11000 {
+		return true
+	}
+	lowerMsg := strings.ToLower(msg)
+	return strings.Contains(lowerMsg, "document already exists") ||
+		strings.Contains(lowerMsg, "e11000") ||
+		strings.Contains(lowerMsg, "duplicate key")
 }
 
 // buildWriteModel builds a single mongo.WriteModel from a WriteOperation, transforming Firestore-incompatible keys.

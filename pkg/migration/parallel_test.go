@@ -652,3 +652,30 @@ func TestNonDMLGracefulSkipBSONParsing(t *testing.T) {
 	}
 }
 
+func TestIsDuplicateKeyError(t *testing.T) {
+	testCases := []struct {
+		code     int
+		msg      string
+		expected bool
+	}{
+		{code: 11000, msg: "some error", expected: true},
+		{code: 0, msg: "Document already exists", expected: true},
+		{code: 0, msg: "document already exists", expected: true},
+		{code: 0, msg: "DOCUMENT ALREADY EXISTS", expected: true},
+		{code: 0, msg: "E11000 duplicate key error collection", expected: true},
+		{code: 0, msg: "e11000 duplicate key error", expected: true},
+		{code: 0, msg: "duplicate key error index: _id_", expected: true},
+		{code: 0, msg: "Duplicate Key Error", expected: true},
+		{code: 0, msg: "connection reset by peer", expected: false},
+		{code: 0, msg: "too much contention", expected: false},
+		{code: 12345, msg: "random error", expected: false},
+	}
+
+	for _, tc := range testCases {
+		res := isDuplicateKeyError(tc.code, tc.msg)
+		if res != tc.expected {
+			t.Errorf("isDuplicateKeyError(%d, %q) = %v; want %v", tc.code, tc.msg, res, tc.expected)
+		}
+	}
+}
+
