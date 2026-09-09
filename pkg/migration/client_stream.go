@@ -528,12 +528,14 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, r.config.IncrementalStreamPartitions)
 		token, err := LoadResumeToken(partitionPath)
 		if err != nil || token == nil {
-			// If a token is missing/nil here (despite our check), it's a fatal failure in partitioned mode.
-			if r.config.IncrementalStreamPartitions > 1 {
+			// If a token is missing/nil here (despite our check), it's a fatal failure in partitioned mode (unless starting from liveStartTime).
+			if r.config.IncrementalStreamPartitions > 1 && liveStartTime == nil {
 				return fmt.Errorf("fatal: partition checkpoint file %s exists but is empty or unreadable: %v", partitionPath, err)
 			}
 			// Fallback is only allowed in legacy single-stream mode
-			r.log.Warnf("[Partition %d] No valid partition checkpoint found at %s (falling back to global checkpoint: %v, token: %v)", i, partitionPath, err, token)
+			if liveStartTime == nil {
+				r.log.Warnf("[Partition %d] No valid partition checkpoint found at %s (falling back to global checkpoint: %v, token: %v)", i, partitionPath, err, token)
+			}
 			token = globalResumeToken
 		}
 		partitionTokens = append(partitionTokens, token)

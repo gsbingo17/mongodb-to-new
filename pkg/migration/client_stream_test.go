@@ -308,3 +308,47 @@ func TestStartReplicationLegacyUpgradeSuccess(t *testing.T) {
 		nil,
 	)
 }
+
+func TestStartReplicationLiveOnlyWithMultiplePartitionsAndLiveStartTime(t *testing.T) {
+	log := logger.New()
+	tmpDir := t.TempDir()
+	globalResumeTokenPath := filepath.Join(tmpDir, "resumeToken-global.json")
+
+	r := &ClientLevelReplicator{
+		log: log,
+		config: &config.Config{
+			IncrementalStreamPartitions: 4, // 4 partitions configured
+		},
+	}
+	ctx := context.Background()
+	liveStartTime := &primitive.Timestamp{T: 1716234000, I: 1}
+
+	panicked := false
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				panicked = true
+			}
+		}()
+
+		err := r.StartReplication(
+			ctx,
+			nil, // No global resume token
+			globalResumeTokenPath,
+			nil, // No initial migration state
+			filepath.Join(tmpDir, "state.json"),
+			config.DatabasePair{},
+			true, // liveOnly = true
+			liveStartTime,
+			nil,
+		)
+
+		if err != nil {
+			t.Fatalf("expected StartReplication to proceed without fatal error, got: %v", err)
+		}
+	}()
+
+	if !panicked {
+		t.Errorf("expected StartReplication to proceed past partition token loading to stream creation (panicking on nil sourceDB)")
+	}
+}

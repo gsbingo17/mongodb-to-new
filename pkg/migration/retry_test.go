@@ -15,31 +15,66 @@ func TestClassifyError(t *testing.T) {
 	log := logger.New()
 	r := NewRetryManager(3, 10*time.Millisecond, 100*time.Millisecond, true, 2, true, log)
 
-	// Connection errors
-	if r.ClassifyError(errors.New("socket was unexpectedly closed")) != ErrorTypeConnection {
-		t.Error("expected ErrorTypeConnection")
+	// Connection errors (case-insensitive checks)
+	connectionCases := []string{
+		"socket was unexpectedly closed",
+		"Socket was unexpectedly closed",
+		"EOF",
+		"eof",
+		"connection reset by peer",
+		"Connection Reset By Peer",
+		"broken pipe",
+		"Broken Pipe",
+		"i/o timeout",
+		"I/O Timeout",
+		"DeadlineExceeded",
+		"Deadline exceeded",
+		"deadline exceeded",
+		"DEADLINE_EXCEEDED",
 	}
-	if r.ClassifyError(errors.New("EOF")) != ErrorTypeConnection {
-		t.Error("expected ErrorTypeConnection")
-	}
-	if r.ClassifyError(errors.New("i/o timeout")) != ErrorTypeConnection {
-		t.Error("expected ErrorTypeConnection")
+	for _, msg := range connectionCases {
+		if r.ClassifyError(errors.New(msg)) != ErrorTypeConnection {
+			t.Errorf("expected ErrorTypeConnection for %q", msg)
+		}
 	}
 
-	// Contention errors
-	if r.ClassifyError(errors.New("too much contention")) != ErrorTypeContention {
-		t.Error("expected ErrorTypeContention")
+	// Contention errors (case-insensitive checks)
+	contentionCases := []string{
+		"too much contention",
+		"Too much contention on these documents. Please try again.",
+		"cross-transaction contention",
+		"Cross-Transaction Contention",
+		"lock timeout",
+		"Lock Timeout",
+		"TransientTransactionError",
+		"transienttransactionerror",
+		"transient transaction error",
+		"WriteConflict",
+		"write conflict",
+		"schema change",
+		"Schema Change",
+		"request was aborted due to a schema change involving the indexes used in the request. Retry the request to run against the updated schema",
+		"OperationFailed: operation was Aborted",
+		"operationfailed: aborted",
+		"exceeded time limit",
+		"Exceeded Time Limit",
 	}
-	if r.ClassifyError(errors.New("TransientTransactionError")) != ErrorTypeContention {
-		t.Error("expected ErrorTypeContention")
-	}
-	if r.ClassifyError(errors.New("request was aborted due to a schema change involving the indexes used in the request. Retry the request to run against the updated schema")) != ErrorTypeContention {
-		t.Error("expected ErrorTypeContention for Firestore schema change index error")
+	for _, msg := range contentionCases {
+		if r.ClassifyError(errors.New(msg)) != ErrorTypeContention {
+			t.Errorf("expected ErrorTypeContention for %q", msg)
+		}
 	}
 
-	// Invalid _id type error
-	if r.ClassifyError(errors.New("_id must be an objectId, string, long")) != ErrorTypeInvalidIdType {
-		t.Error("expected ErrorTypeInvalidIdType")
+	// Invalid _id type error (case-insensitive checks)
+	invalidIdCases := []string{
+		"_id must be an objectId, string, long",
+		"_id must be an ObjectId, string, long",
+		"_ID MUST BE AN OBJECTID, STRING, LONG",
+	}
+	for _, msg := range invalidIdCases {
+		if r.ClassifyError(errors.New(msg)) != ErrorTypeInvalidIdType {
+			t.Errorf("expected ErrorTypeInvalidIdType for %q", msg)
+		}
 	}
 
 	// Other errors

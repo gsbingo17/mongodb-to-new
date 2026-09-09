@@ -255,10 +255,10 @@ func isContentionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "cross-transaction contention") ||
-		(strings.Contains(errStr, "Aborted") && strings.Contains(errStr, "contention")) ||
-		strings.Contains(errStr, "too much contention")
+	errLower := strings.ToLower(err.Error())
+	return strings.Contains(errLower, "cross-transaction contention") ||
+		(strings.Contains(errLower, "aborted") && strings.Contains(errLower, "contention")) ||
+		strings.Contains(errLower, "too much contention")
 }
 
 // CreateIndexFromDefinitionAsync creates an index asynchronously in a goroutine.

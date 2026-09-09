@@ -2143,7 +2143,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 								}
 							}
 						}
-						if !isDup && (strings.Contains(err.Error(), "duplicate key error") || strings.Contains(err.Error(), "E11000")) {
+						if !isDup && isDuplicateKeyError(0, err.Error()) {
 							isDup = true
 						}
 

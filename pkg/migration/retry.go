@@ -70,32 +70,36 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 	}
 
 	errStr := err.Error()
+	errLower := strings.ToLower(errStr)
 
 	// Check for connection errors
-	if strings.Contains(errStr, "socket was unexpectedly closed") ||
-		strings.Contains(errStr, "EOF") ||
-		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "i/o timeout") ||
-		strings.Contains(errStr, "DeadlineExceeded") ||
-		strings.Contains(errStr, "Deadline exceeded") ||
-		strings.Contains(errStr, "deadline exceeded") {
+	if strings.Contains(errLower, "socket was unexpectedly closed") ||
+		strings.Contains(errLower, "eof") ||
+		strings.Contains(errLower, "connection reset by peer") ||
+		strings.Contains(errLower, "broken pipe") ||
+		strings.Contains(errLower, "i/o timeout") ||
+		strings.Contains(errLower, "deadlineexceeded") ||
+		strings.Contains(errLower, "deadline exceeded") ||
+		strings.Contains(errLower, "deadline_exceeded") {
 		return ErrorTypeConnection
 	}
 
 	// Check for contention errors (includes Firestore "schema change" during concurrent index builds)
-	if strings.Contains(errStr, "too much contention") ||
-		strings.Contains(errStr, "lock timeout") ||
-		strings.Contains(errStr, "OperationFailed") && strings.Contains(errStr, "Aborted") ||
-		strings.Contains(errStr, "TransientTransactionError") ||
-		strings.Contains(errStr, "WriteConflict") ||
-		strings.Contains(errStr, "schema change") ||
-		strings.Contains(errStr, "exceeded time limit") {
+	if strings.Contains(errLower, "too much contention") ||
+		strings.Contains(errLower, "cross-transaction contention") ||
+		strings.Contains(errLower, "lock timeout") ||
+		(strings.Contains(errLower, "operationfailed") && strings.Contains(errLower, "aborted")) ||
+		strings.Contains(errLower, "transienttransactionerror") ||
+		strings.Contains(errLower, "transient transaction error") ||
+		strings.Contains(errLower, "writeconflict") ||
+		strings.Contains(errLower, "write conflict") ||
+		strings.Contains(errLower, "schema change") ||
+		strings.Contains(errLower, "exceeded time limit") {
 		return ErrorTypeContention
 	}
 
 	// Check for invalid _id type errors
-	if strings.Contains(errStr, "_id must be an objectId, string, long") {
+	if strings.Contains(errLower, "_id must be an objectid, string, long") {
 		r.Logger.Debugf("Invalid _id type error detected: %s", errStr)
 		return ErrorTypeInvalidIdType
 	}
