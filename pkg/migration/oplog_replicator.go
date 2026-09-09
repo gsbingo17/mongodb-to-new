@@ -199,18 +199,22 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 			return nil
 		}
 
-		// Determine if initial migration completed with failures
-		status := StatusCompleted
-		if totalFailedCount > 0 {
-			status = StatusCompletedWithFailures
+		// A cancelled context means the run was INTERRUPTED, not finished. The
+		// un-migrated remainder is counted as "failed" but not DLQ'd, so marking
+		// completed_with_failures would ban the database on the next run with an
+		// empty DLQ and no recovery path. Leave the state in-progress for a clean
+		// re-run.
+		if ctx.Err() != nil {
+			r.log.Warnf("Initial migration for %s interrupted (context cancelled); ~%d documents remain un-migrated. Leaving state in-progress for a clean re-run.",
+				pair.Source.Database, totalFailedCount)
+			return ctx.Err()
 		}
-		if r.dlq != nil {
-			if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
-				if r.dlq.Count() > 0 {
-					status = StatusCompletedWithFailures
-				}
-			}
-		}
+
+		// Determine the terminal status. completed_with_failures is NON-BLOCKING:
+		// failed documents are captured in the DLQ with their error reason and
+		// recovered later via retry-dlq; every other document migrated normally
+		// and replication proceeds. (Shared across all replication paths.)
+		status, _ := resolveInitialMigrationOutcome(r.dlq, totalFailedCount, r.log)
 
 		// Mark initial migration state as complete
 		if !r.DryRun {
@@ -219,9 +223,6 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 			}
 		}
 
-		if status == StatusCompletedWithFailures {
-			return fmt.Errorf("initial migration completed with %d failures and/or DLQ entries. Aborting replication", totalFailedCount)
-		}
 		r.log.Info("Initial migration completed. Starting incremental replication.")
 	} else {
 		r.log.Info("Initial migration already marked as completed. Skipping.")

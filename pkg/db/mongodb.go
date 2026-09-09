@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
@@ -31,6 +32,14 @@ type MongoDB struct {
 	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
 	failedIndexes  []FailedIndex  // indexes that failed to be created (populated by async builds)
 	failedIndexMu  sync.Mutex     // protects failedIndexes
+
+	// Index-build progress (for the console's "创建索引 M/N" indicator). indexTotal
+	// counts every async build launched this run; indexDone counts those finished
+	// (success OR failure). indexBuilding names the index currently being sent to
+	// the server ("coll[name]"), "" when idle. All read via IndexProgress().
+	indexTotal    int64 // atomic
+	indexDone     int64 // atomic
+	indexBuilding atomic.Value // string; the index currently being built
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
@@ -93,6 +102,19 @@ func (m *MongoDB) SetIndexConcurrency(n int) {
 // Used by index-only mode to ensure the process doesn't exit before indexes are created.
 func (m *MongoDB) WaitForIndexCreation() {
 	m.indexWg.Wait()
+}
+
+// IndexProgress reports async index-build progress: total launched, total finished
+// (success or failure), and the index currently being built ("coll[name]", or ""
+// when idle). Safe for concurrent reads while builds are in flight — this is what
+// the console's "创建索引 M/N" indicator polls.
+func (m *MongoDB) IndexProgress() (total, done int, building string) {
+	total = int(atomic.LoadInt64(&m.indexTotal))
+	done = int(atomic.LoadInt64(&m.indexDone))
+	if v, ok := m.indexBuilding.Load().(string); ok {
+		building = v
+	}
+	return total, done, building
 }
 
 // GetFailedIndexes returns a copy of the failed index list.
@@ -280,9 +302,13 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 
 	// Track this goroutine so callers can wait for all index builds to finish
 	m.indexWg.Add(1)
+	// Progress accounting for the console indicator: count the build as launched now,
+	// count it as done when the goroutine returns (whether it succeeded or failed).
+	atomic.AddInt64(&m.indexTotal, 1)
 
 	go func() {
 		defer m.indexWg.Done()
+		defer atomic.AddInt64(&m.indexDone, 1)
 		// Acquire semaphore — blocks until a slot is available.
 		// This serializes index creation to avoid Firestore cross-transaction contention.
 		if m.indexSemaphore != nil {
@@ -359,6 +385,16 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 	}()
 }
 
+// CreateIDIndexAsync launches an async build of the {_id: 1} index (named "_id_")
+// on a target collection. Firestore's MongoDB-compat API — unlike real MongoDB —
+// does NOT auto-create the _id index, so migrations must create it explicitly or
+// _id lookups/ordering have no backing index. Reuses the throttled/retrying async
+// path. Idempotent at the call site (skip when target already has "_id_").
+func (m *MongoDB) CreateIDIndexAsync(connectionString, collectionName string) {
+	idDef := bson.M{"name": "_id_", "key": bson.D{{Key: "_id", Value: 1}}}
+	m.CreateIndexFromDefinitionAsync(connectionString, collectionName, idDef)
+}
+
 // createIndexOnCollection is a helper that creates an index on a given collection.
 // It contains the shared index model building logic used by the async path.
 func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo.Collection, collectionName string, indexDef bson.M) error {
@@ -424,6 +460,9 @@ func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo
 	indexModel.Options = opts
 
 	m.log.Infof("[async] Sending index creation request for '%s' on collection '%s' to Firestore...", indexName, collectionName)
+	// Publish which index is being built so the console can show "正在建：coll[name]".
+	m.indexBuilding.Store(fmt.Sprintf("%s[%s]", collectionName, indexName))
+	defer m.indexBuilding.Store("")
 	startTime := time.Now()
 	_, err := collection.Indexes().CreateOne(ctx, indexModel)
 	if err != nil {

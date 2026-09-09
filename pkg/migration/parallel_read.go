@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"github.com/gsbingo17/mongodb-migration/pkg/partition"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -38,25 +39,12 @@ func NewCollectionPartitioner(sourceCollection *mongo.Collection,
 	}
 }
 
-// CalculatePartitionCount calculates the optimal partition count based on document count, min docs per partition, and max partitions.
+// CalculatePartitionCount calculates the optimal partition count based on
+// document count, min docs per partition, and max partitions. It delegates to
+// partition.Count, the single source of truth shared with the assessment
+// recommender so the advised MaxReadPartitions matches what the engine creates.
 func CalculatePartitionCount(totalCount int64, minDocsPerPartition, maxPartitions int) int {
-	if minDocsPerPartition <= 0 {
-		minDocsPerPartition = 1
-	}
-	if maxPartitions <= 0 {
-		maxPartitions = 1
-	}
-	if totalCount < int64(minDocsPerPartition) {
-		return 1
-	}
-	partitionCount := int(totalCount) / minDocsPerPartition
-	if partitionCount > maxPartitions {
-		partitionCount = maxPartitions
-	}
-	if partitionCount < 1 {
-		partitionCount = 1
-	}
-	return partitionCount
+	return partition.Count(totalCount, minDocsPerPartition, maxPartitions)
 }
 
 // CalculatePartitionCount calculates the optimal partition count for the partitioner's configured settings.

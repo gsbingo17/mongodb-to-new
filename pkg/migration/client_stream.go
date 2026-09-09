@@ -316,16 +316,14 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
 
-		// Sync indexes before migrating data if configured
-		if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
-			r.log.Info("Syncing indexes before initial migration")
-
-			// Configure index build concurrency before launching any async builds
+		// IndexOnly mode: build indexes up front and return without migrating data.
+		// This is the ONLY case where indexes are built before a data load, because
+		// creating indexes IS the whole job here.
+		if pair.Target.IndexOnly {
+			r.log.Info("IndexOnly mode enabled. Syncing indexes, then skipping data migration.")
 			if migrator.config.IndexConcurrency > 0 {
 				r.targetDB.SetIndexConcurrency(migrator.config.IndexConcurrency)
 			}
-
-			// Build collections list from collectionMap
 			var collections []config.CollectionConfig
 			for _, colls := range r.collectionConfigs {
 				for _, collConfig := range colls {
@@ -333,32 +331,23 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 				}
 			}
 			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
-				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+				r.log.Warnf("Index sync encountered issues: %v", err)
 			}
-
-			// Index-Only mode: wait for all async index builds then return without migrating data
-			if pair.Target.IndexOnly {
-				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
-				r.targetDB.WaitForIndexCreation()
-				migrator.logFailedIndexes(r.targetDB)
-				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration and change stream.")
-				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
-
-				// Determine if initial migration completed with failures (none in IndexOnly since no data migrated)
-				if err := SaveInitialMigrationState(initialMigrationStatePath, StatusCompleted, 0); err != nil {
-					r.log.Errorf("Error saving initial migration state as complete: %v", err)
-				}
-				return nil
-			}
-
-			// Wait for all async index creation to complete before starting data migration
-			// This prevents "schema change" errors from Firestore when indexes are being built
-			// concurrently with data writes
-			r.log.Info("Waiting for all async index creation to complete before starting data migration...")
+			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
 			migrator.logFailedIndexes(r.targetDB)
-			r.log.Info("All indexes created. Proceeding with data migration.")
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusCompleted, 0); err != nil {
+				r.log.Errorf("Error saving initial migration state as complete: %v", err)
+			}
+			return nil
 		}
+
+		// NOTE: indexes are intentionally NOT built here. Building them before the
+		// backfill makes Firestore re-index on every inserted document, stalling the
+		// whole load behind a multi-minute build (and leaving the console blank the
+		// entire time). They are deferred until after the backfill loads and
+		// replication lag has settled — see the DeferredIndexController launched
+		// before change-stream processing below. This matches the legacy oplog path.
 
 		throttlerCtx, throttlerCancel := context.WithCancel(ctx)
 		defer throttlerCancel()
@@ -379,7 +368,15 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			concurrentCollections = 4
 		}
 		r.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
-		semaphore := make(chan struct{}, concurrentCollections)
+		// Resizable so the console can raise/lower collection concurrency on a
+		// running job (Migrator.Reconfig) without a restart. Registered on the
+		// migrator so /api/reconfig can reach it; shrinking never preempts
+		// in-flight collections (see resizableSem).
+		sem := newResizableSem(concurrentCollections)
+		if migrator != nil {
+			migrator.setCollSem(sem)
+			defer migrator.clearCollSem(sem)
+		}
 		var wg sync.WaitGroup
 
 		// Track overall statistics
@@ -398,14 +395,19 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 
 		// Iterate through all collections in the map
+	dispatch:
 		for sourceDB, collections := range r.collectionConfigs {
 			for sourceCollection, collConfig := range collections {
+				// Acquire a slot; unlike a fixed channel this respects ctx and a
+				// live limit change. On cancellation stop dispatching further work.
+				if err := sem.Acquire(ctx); err != nil {
+					break dispatch
+				}
 				wg.Add(1)
-				semaphore <- struct{}{}
 
 				go func(sourceDB, sourceCollection string, collConfig config.CollectionConfig) {
 					defer wg.Done()
-					defer func() { <-semaphore }()
+					defer sem.Release()
 
 					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, collConfig.TargetCollection)
 
@@ -465,18 +467,22 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 		}
 
-		// Determine if initial migration completed with failures
-		status := StatusCompleted
-		if totalFailedCount > 0 {
-			status = StatusCompletedWithFailures
+		// A cancelled context means the run was INTERRUPTED, not finished. The
+		// un-migrated remainder is counted as "failed" but not DLQ'd (that's the
+		// mismatch warned about above), so marking completed_with_failures would
+		// ban the database on the next run with an empty DLQ and no recovery
+		// path. Leave the state in-progress for a clean re-run.
+		if ctx.Err() != nil {
+			r.log.Warnf("Initial migration for %s interrupted (context cancelled); ~%d documents remain un-migrated. Leaving state in-progress for a clean re-run.",
+				pair.Source.Database, totalFailedCount)
+			return ctx.Err()
 		}
-		if r.dlq != nil {
-			if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
-				if r.dlq.Count() > 0 {
-					status = StatusCompletedWithFailures
-				}
-			}
-		}
+
+		// Determine the terminal status. completed_with_failures is NON-BLOCKING:
+		// failed documents are captured in the DLQ with their error reason and
+		// recovered later via retry-dlq; every other document migrated normally
+		// and replication proceeds. (Shared across all replication paths.)
+		status, _ := resolveInitialMigrationOutcome(r.dlq, totalFailedCount, r.log)
 
 		if !r.DryRun {
 			if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
@@ -484,9 +490,6 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 		}
 
-		if status == StatusCompletedWithFailures {
-			return fmt.Errorf("initial migration completed with %d failures and/or DLQ entries. Aborting replication", totalFailedCount)
-		}
 		r.log.Info("Starting incremental replication.")
 	} else {
 		r.log.Info("Initial migration already marked as completed. Skipping.")
@@ -494,8 +497,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
 	if pair.Target.IndexOnly {
-		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
-			// Resume token exists, so initial migration was skipped — sync indexes now
+		if !needsInitialMigration {
+			// Resume token exists, so initial migration was skipped — sync indexes
+			// now. Always runs (even with SyncAllIndexes off) so the _id index gets
+			// built; secondary indexes remain gated inside syncIndexes.
 			r.log.Info("IndexOnly mode: resume token exists, performing index sync directly")
 			// Build collections list from collectionConfigs
 
@@ -639,6 +644,40 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		r.incrementalStatsManager,
 	)
 	distributor.DryRun = r.DryRun
+
+	// Deferred index build: the backfill is done and the change stream is open, so
+	// build indexes once replication lag has settled — never up front, so Firestore
+	// does not re-index on every backfilled/streamed write. This is the same rule
+	// the legacy path applies; both share DeferredIndexController so they cannot
+	// drift apart. Idempotent on resume (indexes already exist -> no-op build).
+	deferredIdx := NewDeferredIndexController(migrator, r.targetDB, r.config, r.log, func(ctx context.Context) {
+		var collections []config.CollectionConfig
+		for _, colls := range r.collectionConfigs {
+			for _, collConfig := range colls {
+				collections = append(collections, collConfig)
+			}
+		}
+		if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
+			r.log.Warnf("Deferred index sync encountered issues: %v", err)
+		}
+	})
+	go deferredIdx.PollProgress(ctx)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				lag := -1.0
+				if r.incrementalStatsManager != nil {
+					lag = r.incrementalStatsManager.RecentLagSeconds()
+				}
+				deferredIdx.Observe(ctx, lag)
+			}
+		}
+	}()
 
 	// Start event distribution
 	err = distributor.Start()

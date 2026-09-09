@@ -148,6 +148,33 @@ type IncrementalStatsManager struct {
 	ingestQueueWaitCount   int64
 	batchingQueueWaitNs    int64
 	batchingQueueWaitCount int64
+
+	// Per-namespace incremental counters (console per-collection live rows).
+	// The change-stream path aggregates stats by opType; the console needs them
+	// per "db.coll" so the operator can see, at cutover time, exactly which
+	// collection is behind or has failures. Populated in RecordLags — the single
+	// choke point where every applied/failed op passes through — keyed by
+	// op.Namespace. recentLagNs is the end-to-end lag (SuccessTime-EventTime) of
+	// the most recently applied op, used as the live lag reading (-1 when idle).
+	nsMu        sync.Mutex
+	nsStats     map[string]*nsCounter
+	recentLagNs int64 // atomic; -1 means no recent applied op (idle)
+}
+
+// nsCounter holds cumulative per-namespace incremental counts for the console.
+type nsCounter struct {
+	processed int64
+	failed    int64
+	dlq       int64
+}
+
+// NsIncrementalStat is a snapshot of one namespace's cumulative incremental
+// counters, consumed by the console observer to emit per-collection live rows.
+type NsIncrementalStat struct {
+	Namespace string // "db.coll"
+	Processed int64
+	Failed    int64
+	DLQ       int64
 }
 
 // SetDLQ sets the DLQ reference for monitoring.
@@ -275,7 +302,67 @@ func NewIncrementalStatsManager(log *logger.Logger, interval time.Duration, grou
 		groupOpsByDistinctId: distinctId,
 		failureBreakdown:     make(map[string]map[string]int64),
 		skippedEvents:        make(map[string]int64),
+		nsStats:              make(map[string]*nsCounter),
+		recentLagNs:          -1,
 	}
+}
+
+// recordNamespaceOp updates the per-namespace console counters for one op. Cheap
+// map lookup under nsMu; namespace is "db.coll". Called from RecordLags only.
+func (sm *IncrementalStatsManager) recordNamespaceOp(namespace string, success, dlqed bool) {
+	if namespace == "" {
+		return
+	}
+	sm.nsMu.Lock()
+	c := sm.nsStats[namespace]
+	if c == nil {
+		c = &nsCounter{}
+		sm.nsStats[namespace] = c
+	}
+	if success {
+		c.processed++
+	} else {
+		c.failed++
+		if dlqed {
+			c.dlq++
+		}
+	}
+	sm.nsMu.Unlock()
+}
+
+// NamespaceStatsSnapshot returns a copy of the per-namespace counters for the
+// console. Cheap; called every ~2s by the observer poll loop.
+func (sm *IncrementalStatsManager) NamespaceStatsSnapshot() []NsIncrementalStat {
+	if sm == nil {
+		return nil
+	}
+	sm.nsMu.Lock()
+	defer sm.nsMu.Unlock()
+	out := make([]NsIncrementalStat, 0, len(sm.nsStats))
+	for ns, c := range sm.nsStats {
+		out = append(out, NsIncrementalStat{
+			Namespace: ns,
+			Processed: c.processed,
+			Failed:    c.failed,
+			DLQ:       c.dlq,
+		})
+	}
+	return out
+}
+
+// RecentLagSeconds returns the end-to-end lag (seconds) of the most recently
+// applied op, or -1 when no op has been applied yet / the stream is idle. Used
+// as the live lag reading for the change-stream (modern) path, where lag is a
+// shared stream-position property rather than per-collection.
+func (sm *IncrementalStatsManager) RecentLagSeconds() float64 {
+	if sm == nil {
+		return -1
+	}
+	ns := atomic.LoadInt64(&sm.recentLagNs)
+	if ns < 0 {
+		return -1
+	}
+	return float64(ns) / float64(time.Second)
 }
 
 // RecordLags records processing lag for a batch of operations and increments processed events count
@@ -292,8 +379,14 @@ func (sm *IncrementalStatsManager) RecordLags(ops []WriteOperation) {
 	for _, op := range ops {
 		if !op.SuccessTime.IsZero() {
 			sm.IncrementEventsProcessed(op.OpType, 1)
+			sm.recordNamespaceOp(op.Namespace, true, false)
+			// Track the freshest end-to-end lag for the console live reading.
+			if !op.EventTime.IsZero() {
+				atomic.StoreInt64(&sm.recentLagNs, int64(op.SuccessTime.Sub(op.EventTime)))
+			}
 		} else {
 			sm.IncrementEventsFailed(op.OpType, op.DLQed, op.Error)
+			sm.recordNamespaceOp(op.Namespace, false, op.DLQed)
 		}
 	}
 }
@@ -803,6 +896,20 @@ func (sm *IncrementalStatsManager) GetProcessedCount(opType string) int {
 		return int(atomic.LoadInt64(&sm.opsStats[idx].processed))
 	}
 	return 0
+}
+
+// TotalProcessed returns the total number of change events applied to the target
+// across all operation types. Lock-free; safe for concurrent reads by external
+// observers (the web console).
+func (sm *IncrementalStatsManager) TotalProcessed() int64 {
+	if sm == nil {
+		return 0
+	}
+	var total int64
+	for i := 0; i <= opMixed; i++ {
+		total += atomic.LoadInt64(&sm.opsStats[i].processed)
+	}
+	return total
 }
 
 // GetWorkerReceivedCount returns the count of worker received events of the given type thread-safely and lock-freely

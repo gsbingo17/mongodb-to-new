@@ -46,8 +46,10 @@ func (r *InitialMigrator) Run(ctx context.Context, pair config.DatabasePair, mig
 	initialMigrationStart := time.Now()
 	r.log.Info("Performing initial migration for all collections (shared pipeline)")
 
-	// Sync indexes before migrating data if configured
-	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
+	// Sync indexes before migrating data. Always runs: syncIndexes creates the
+	// _id index unconditionally (Firestore does not auto-create it) and only the
+	// secondary indexes are gated on SyncAllIndexes / explicit Indexes.
+	{
 		r.log.Info("Syncing indexes before initial migration")
 		var collections []config.CollectionConfig
 		for _, colls := range r.collectionConfigs {
@@ -95,7 +97,17 @@ func (r *InitialMigrator) Run(ctx context.Context, pair config.DatabasePair, mig
 				defer func() { <-semaphore }()
 
 				targetCollection := collConfig.TargetCollection
-				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)", 
+				// Apply a rename-collection remediation (reserved __x__ → _x_) so the
+				// initial load lands in the sanitized collection the assessment
+				// simulated. No-op when no such fix is registered.
+				if r.transformer != nil {
+					renamed := r.transformer.SanitizeTargetName(sourceDB, sourceCollection, targetCollection)
+					if renamed != targetCollection {
+						recordCollectionRename(r.log, sourceDB, sourceCollection, renamed)
+					}
+					targetCollection = renamed
+				}
+				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)",
 					sourceDB, sourceCollection, targetCollection, collConfig.UpsertMode)
 
 				sourceDBCollection := r.sourceDB.GetCollection(sourceCollection)

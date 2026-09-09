@@ -20,6 +20,22 @@ type Config struct {
 	TargetMaxPoolSize         int            `json:"targetMaxPoolSize"`         // Maximum connection pool size for target
 	IndexConcurrency          int            `json:"indexConcurrency"`          // Max concurrent async index builds (default 1 for Firestore)
 
+	// Deferred index-build timing (legacy live mode). Secondary indexes are built
+	// AFTER the initial full load. In live mode the build is further deferred until
+	// replication lag has settled, so index creation does not contend with the
+	// catch-up write burst on Firestore.
+	IndexBuildLagThresholdSeconds int `json:"indexBuildLagThresholdSeconds"` // Max lag (s) considered "caught up" enough to start building indexes (default 5)
+	IndexBuildLagStableChecks     int `json:"indexBuildLagStableChecks"`     // Consecutive low-lag report cycles required before triggering the build (default 3)
+
+	// Cutover readiness (console). A live collection is "ready to cut over" when
+	// its lag is at/under this threshold (or it is idle/caught up) with zero
+	// failed writes and zero DLQ entries, held stable for this many consecutive
+	// report cycles. Surfaced to the console so the operator can safely stop the
+	// source before verifying. These are display-only thresholds; the frontend
+	// computes the ready/amber/red signal from them.
+	CutoverLagThresholdSeconds int `json:"cutoverLagThresholdSeconds"` // Max lag (s) still considered "caught up" for cutover (default 5)
+	CutoverStableChecks        int `json:"cutoverStableChecks"`        // Consecutive healthy cycles required before showing "ready" (default 3)
+
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
 	InitialWriteBatchSize    int `json:"initialWriteBatchSize"`    // Number of documents to write in a batch during initial migration
@@ -78,6 +94,7 @@ type RetryConfig struct {
 	EnableBatchSplitting bool `json:"enableBatchSplitting"` // Enable batch splitting for contention errors
 	MinBatchSize         int  `json:"minBatchSize"`         // Minimum batch size for splitting
 	ConvertInvalidIds    bool `json:"convertInvalidIds"`    // Convert invalid _id types to string
+	ResyncFromSource     bool `json:"resyncFromSource"`     // In retry-dlq mode, re-read each failed doc from the SOURCE by _id (fresh copy) instead of replaying the DLQ snapshot; source-deleted docs are treated as resolved
 }
 
 // DatabasePair represents a source and target database pair
@@ -102,6 +119,29 @@ type TargetConfig struct {
 	IndexOnly        bool               `json:"indexOnly,omitempty"`      // Only sync indexes, skip data migration
 	UpsertMode       bool               `json:"upsertMode,omitempty"`     // Use upsert by default for all collections in this database target
 	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
+	// CollectionTuning holds optional PER-COLLECTION overrides of the partitioned
+	// initial-load knobs, keyed by SOURCE collection name. It is independent of
+	// Collections, so it applies in whole-database mode too (where Collections is
+	// empty). Absent entries — and zero/nil fields within an entry — inherit the
+	// global config. This lets a single straggler collection be partitioned
+	// independently without changing the global settings.
+	CollectionTuning map[string]CollectionTuning `json:"collectionTuning,omitempty"`
+}
+
+// CollectionTuning holds optional per-collection overrides for the partitioned
+// initial-load knobs. Only the partition levers are per-collection; the
+// cross-collection knobs (ConcurrentCollections, worker counts) stay global. A
+// nil ParallelReadsEnabled or a zero int means "inherit the global value". The
+// motivating case is a collection with few but very large documents: it never
+// crosses the global doc-count threshold (MinDocsForParallelReads) so it loads
+// on a single cursor and stalls; overriding just that collection forces it to
+// partition.
+type CollectionTuning struct {
+	ParallelReadsEnabled    *bool `json:"parallelReadsEnabled,omitempty"`
+	MaxReadPartitions       int   `json:"maxReadPartitions,omitempty"`
+	WorkersPerPartition     int   `json:"workersPerPartition,omitempty"`
+	MinDocsPerPartition     int   `json:"minDocsPerPartition,omitempty"`
+	MinDocsForParallelReads int   `json:"minDocsForParallelReads,omitempty"`
 }
 
 // CollectionConfig represents a collection mapping
@@ -143,6 +183,18 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, err
 	}
 
+	// Apply defaults to every unset tunable.
+	ApplyDefaults(&config)
+
+	return &config, nil
+}
+
+// ApplyDefaults fills in default values for any tunable left at its zero value.
+// It is shared by LoadConfig (file-based configs) and by in-memory config
+// builders such as the wizard/console, so a programmatically-assembled config
+// gets the exact same defaults as one parsed from JSON. Safe to call on an
+// already-defaulted config (idempotent).
+func ApplyDefaults(config *Config) {
 	// Set default save threshold if not provided
 	if config.SaveThreshold <= 0 {
 		config.SaveThreshold = 100
@@ -220,6 +272,22 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.ConcurrentCollections = 4 // Default to 4 concurrent collections
 	}
 
+	if config.IndexBuildLagThresholdSeconds <= 0 {
+		config.IndexBuildLagThresholdSeconds = 5 // Default: treat lag <= 5s as caught up
+	}
+
+	if config.IndexBuildLagStableChecks <= 0 {
+		config.IndexBuildLagStableChecks = 3 // Default: 3 consecutive low-lag cycles
+	}
+
+	if config.CutoverLagThresholdSeconds <= 0 {
+		config.CutoverLagThresholdSeconds = 5 // Default: lag <= 5s counts as caught up for cutover
+	}
+
+	if config.CutoverStableChecks <= 0 {
+		config.CutoverStableChecks = 3 // Default: 3 healthy cycles before showing "ready"
+	}
+
 	// Already set default values for incremental replication parameters above
 
 	// Set default values for parallel reads
@@ -283,8 +351,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	// No backward compatibility needed anymore
-
-	return &config, nil
 }
 
 // validateConfig validates the configuration

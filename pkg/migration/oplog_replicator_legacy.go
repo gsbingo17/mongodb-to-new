@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/globalsign/mgo"
@@ -13,6 +14,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"github.com/gsbingo17/mongodb-migration/pkg/metrics"
 	"github.com/rwynn/gtm"
 	modernbson "go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -33,6 +35,25 @@ type OplogReplicatorLegacy struct {
 	retryManager      *RetryManager                                 // Retry manager for transient errors
 	transformer       *FieldTransformer                             // Field transformer
 	DryRun            bool                                          // Dry run flag
+	migrator          *Migrator                                     // Back-reference for console progress reporting (optional)
+	lastInitialReport map[string]time.Time                          // Per-collection throttle for initial-load console updates
+	initialStart      map[string]time.Time                          // Per-collection start time for initial-load rate calc
+	liveEvents        int64                                         // Cumulative oplog events applied (all collections; atomic)
+	lastEventUnix     int64                                         // Oplog seconds of the most recent applied event (for lag; atomic)
+	liveDBName        string                                        // Source database name for the console live row
+	liveStats         sync.Map                                      // Per-collection live stats: namespace "db.coll" -> *liveCollStat
+	pair              config.DatabasePair                           // The pair being replicated (needed for the deferred index build)
+	deferredIndex     *DeferredIndexController                      // Shared "build indexes after load, once lag settles" controller
+}
+
+// liveCollStat holds the incremental (增量) counters for a single collection so
+// the console can render one live row per collection instead of one aggregate
+// row per database. All numeric fields are updated atomically.
+type liveCollStat struct {
+	db            string
+	coll          string
+	events        int64 // Cumulative oplog events applied to this collection (atomic)
+	lastEventUnix int64 // Oplog seconds of the most recent event for this collection (atomic; for lag)
 }
 
 // NewOplogReplicatorLegacy creates a new oplog-based replicator using GTM legacy
@@ -112,7 +133,27 @@ func (r *OplogReplicatorLegacy) getCurrentOplogTimestamp() (*primitive.Timestamp
 }
 
 // StartReplication starts the oplog-based replication using GTM legacy
-func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, liveStartTime *primitive.Timestamp, migrator *Migrator) error {
+func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, fullOnly bool, liveStartTime *primitive.Timestamp, migrator *Migrator) error {
+	// Keep a back-reference so the initial-load and oplog-tailing paths can push
+	// per-collection progress to the web console (no-op when unattached).
+	r.migrator = migrator
+	r.liveDBName = pair.Source.Database
+	r.pair = pair
+
+	// Shared controller for the "indexes are built after the load, once replication
+	// lag has settled" rule — identical code to the modern change-stream path so the
+	// two can never drift apart again. The injected build primitive is the legacy
+	// _id+secondary index sync.
+	r.deferredIndex = NewDeferredIndexController(migrator, r.targetDB, r.config, r.log, func(ctx context.Context) {
+		r.syncIndexesLegacy(ctx, pair)
+	})
+
+	// Stream deferred index-build progress ("创建索引 M/N") to the console for the
+	// whole run. Cheap no-op when detached; only emits once a build has launched.
+	if r.migrator != nil && r.migrator.controlPlaneAttached() {
+		go r.deferredIndex.PollProgress(ctx)
+	}
+
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -238,35 +279,40 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 			return fmt.Errorf("initial migration failed: %w", err)
 		}
 
-		// Determine if initial migration completed with failures
-		status := StatusCompleted
-		if totalFailedCount > 0 {
-			status = StatusCompletedWithFailures
+		// A cancelled context means the run was INTERRUPTED, not finished. The
+		// un-migrated remainder gets counted as "failed" (batchSize - succeeded)
+		// but is NOT written to the DLQ (cancellation is not a per-document
+		// error). Marking that as completed_with_failures would ban the whole
+		// database on the next run with an empty DLQ and no recovery path. Leave
+		// the state in-progress so a re-run cleanly re-migrates it.
+		if ctx.Err() != nil {
+			r.log.Warnf("Initial migration for %s interrupted (context cancelled); ~%d documents remain un-migrated. Leaving state in-progress for a clean re-run.",
+				pair.Source.Database, totalFailedCount)
+			return ctx.Err()
 		}
-		if r.dlq != nil {
-			if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
-				if r.dlq.Count() > 0 {
-					status = StatusCompletedWithFailures
-				}
-			}
-		}
+
+		// Determine the terminal status. completed_with_failures is NON-BLOCKING:
+		// failed documents are captured in the DLQ with their error reason and
+		// recovered later via retry-dlq; every other document migrated normally
+		// and replication proceeds. (Shared across all replication paths.)
+		status, _ := resolveInitialMigrationOutcome(r.dlq, totalFailedCount, r.log)
 
 		// Mark initial migration state as complete
 		if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
 			r.log.Errorf("Error saving initial migration state as complete: %v", err)
 		}
 
-		if status == StatusCompletedWithFailures {
-			return fmt.Errorf("initial migration completed with %d failures and/or DLQ entries. Aborting replication", totalFailedCount)
-		}
 		r.log.Info("Initial migration completed. Starting incremental replication.")
 	} else {
 		r.log.Info("Initial migration already marked as completed. Skipping.")
 	}
 
-	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
+	// Index-Only mode: sync indexes (if not already done during initial migration) and exit.
+	// Always syncs when the checkpoint already existed — performInitialMigration was
+	// skipped, so no indexes (not even _id) have been built yet. syncIndexesLegacy
+	// always creates _id regardless of SyncAllIndexes, so this runs unconditionally.
 	if pair.Target.IndexOnly {
-		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+		if !needsInitialMigration {
 			// Checkpoint exists, so performInitialMigration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: checkpoint exists, performing index sync directly")
 
@@ -284,6 +330,24 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		return nil
 	}
 
+	// Full-only (migrate) mode: the initial full load is done; stop here without
+	// tailing the oplog. This is a terminal, one-shot copy — writes made to the
+	// source during/after the scan are NOT captured (use live mode for those).
+	//
+	// Indexes are built NOW, after the full load — never before or during it.
+	// Building indexes up front makes Firestore re-index on every inserted
+	// document, which is far slower than a single build over the finished data.
+	// syncIndexesLegacy always creates _id (independent of SyncAllIndexes) and is
+	// idempotent, so this is safe on a fullOnly re-run over an existing checkpoint.
+	if fullOnly {
+		r.log.Info("Full-only mode: initial migration complete. Building indexes now (after full load).")
+		// Same shared "build after load" primitive the live/modern paths use.
+		// Synchronous: the one-shot job must not report done until indexes exist.
+		r.deferredIndex.BuildNow(ctx)
+		r.log.Info("Full-only mode: indexes complete. Skipping oplog tailing (no incremental replication).")
+		return nil
+	}
+
 	// Start oplog tailing using GTM legacy
 	return r.tailOplog(ctx, afterTimestamp, timestampPath)
 }
@@ -293,34 +357,27 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	initialMigrationStart := time.Now()
 	r.log.Info("Performing initial migration for all collections")
 
-	// Sync indexes before migrating data if configured
-	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
-		r.log.Info("Syncing indexes before initial migration (legacy mode)")
-
-		// Configure index build concurrency before launching any async builds
+	// Index-Only mode: build indexes (including _id) and return without migrating
+	// data. syncIndexesLegacy always creates _id regardless of SyncAllIndexes, so
+	// this runs unconditionally.
+	if pair.Target.IndexOnly {
+		r.log.Info("IndexOnly mode: syncing indexes only, skipping data migration (legacy mode)")
 		if r.config.IndexConcurrency > 0 {
 			r.targetDB.SetIndexConcurrency(r.config.IndexConcurrency)
 		}
-
 		r.syncIndexesLegacy(ctx, pair)
-
-		// Index-Only mode: wait for all async index builds then return without migrating data
-		if pair.Target.IndexOnly {
-			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
-			r.targetDB.WaitForIndexCreation()
-			migrator.logFailedIndexes(r.targetDB)
-			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
-			return 0, 0, nil
-		}
-
-		// Wait for all async index creation to complete before starting data migration
-		// This prevents "schema change" errors from Firestore when indexes are being built
-		// concurrently with data writes
-		r.log.Info("Waiting for all async index creation to complete before starting data migration...")
+		r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 		r.targetDB.WaitForIndexCreation()
 		migrator.logFailedIndexes(r.targetDB)
-		r.log.Info("All indexes created. Proceeding with data migration.")
+		r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+		return 0, 0, nil
 	}
+
+	// NOTE: Secondary and _id indexes are intentionally NOT built here. Creating
+	// indexes before (or during) the full load forces Firestore to re-index on
+	// every inserted document. Instead the build happens AFTER the load:
+	//   - full-only mode: immediately after this returns (see StartReplication)
+	//   - live mode:      deferred until replication lag settles (see reportLiveLoop)
 
 	// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
 	concurrentCollections := r.config.ConcurrentCollections
@@ -353,7 +410,16 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 				defer wg.Done()
 				defer func() { <-semaphore }()
 
+				// Apply an operator-approved rename-collection remediation (e.g. the
+				// Firestore-reserved __x__ → _x_) so the full load lands on the SAME
+				// legal target name the index build and the incremental workers use.
+				// Without this, reserved-named source collections write straight to the
+				// illegal name and Firestore rejects every document. Idempotent: a name
+				// that needs no rename is returned unchanged.
 				targetCollection := collConfig.TargetCollection
+				if r.transformer != nil {
+					targetCollection = r.transformer.SanitizeTargetName(sourceDB, sourceCollection, targetCollection)
+				}
 				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)",
 					sourceDB, sourceCollection, targetCollection, collConfig.UpsertMode)
 
@@ -463,6 +529,9 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 							sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, successCount, failedCount)
 					}
 				}
+				// Push a live progress row to the web console on every batch so the
+				// 全量 (initial) bar advances smoothly (no-op for the CLI).
+				r.reportInitialProgress(sourceDB, sourceCollection, int64(count), successCount+failedCount)
 			}
 
 			// Reset doc for next iteration
@@ -527,6 +596,8 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 	}
 
 	totalCount := successCount + failedCount
+	// Final progress row so the console bar lands on 100%.
+	r.reportInitialProgress(sourceDB, sourceCollection, int64(count), totalCount)
 	if failedCount > 0 {
 		r.log.Warnf("Migration for %s.%s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
 			sourceDB, sourceCollection, failedCount, successCount, failedCount, totalCount)
@@ -535,6 +606,41 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 			sourceDB, sourceCollection, totalCount)
 	}
 	return successCount, failedCount
+}
+
+// reportInitialProgress mirrors this collection's initial-load progress into the
+// web console as a per-collection 全量 row, throttled to avoid flooding the
+// registry. No-op when no console is attached.
+func (r *OplogReplicatorLegacy) reportInitialProgress(sourceDB, sourceCollection string, total, done int64) {
+	if r.migrator == nil || !r.migrator.controlPlaneAttached() {
+		return
+	}
+	now := time.Now()
+	key := sourceDB + "." + sourceCollection
+	r.mu.Lock()
+	if r.lastInitialReport == nil {
+		r.lastInitialReport = make(map[string]time.Time)
+		r.initialStart = make(map[string]time.Time)
+	}
+	if r.initialStart[key].IsZero() {
+		r.initialStart[key] = now
+	}
+	start := r.initialStart[key]
+	last, seen := r.lastInitialReport[key]
+	// Throttle to ~1 update/sec per collection, but always let the final
+	// (done==total) update through.
+	if seen && done < total && now.Sub(last) < time.Second {
+		r.mu.Unlock()
+		return
+	}
+	r.lastInitialReport[key] = now
+	r.mu.Unlock()
+
+	var rate float64
+	if elapsed := now.Sub(start).Seconds(); elapsed > 0 {
+		rate = float64(done) / elapsed
+	}
+	r.migrator.reportInitial(sourceDB, sourceCollection, total, done, rate)
 }
 
 // insertBatchWithRetry inserts a batch of documents with sophisticated error handling
@@ -853,6 +959,19 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	flushInterval := time.Duration(r.config.FlushIntervalMs) * time.Millisecond
 	StartPeriodicFlushLoop(ctx, workers, flushInterval, r.log)
 
+	// Web console: transition the job to the live phase. No-op for CLI.
+	if r.migrator != nil && r.migrator.controlPlaneAttached() {
+		r.migrator.markState(metrics.StateLive)
+	}
+	// Always run the live loop. It streams 增量 (incremental) rows with throughput
+	// and replication lag to the console (every migrator call inside is nil-guarded,
+	// so it is a cheap no-op in CLI mode) AND — crucially — it drives the deferred
+	// index build via DeferredIndexController.Observe. The build must happen in every
+	// mode, not only when a console is attached, so this launch is unconditional
+	// (matching the modern change-stream path, which also builds indexes regardless
+	// of the console).
+	go r.reportLiveLoop(ctx)
+
 	// Statistics tracking
 	var processedCount int
 	var lastCheckpoint time.Time = time.Now()
@@ -931,6 +1050,19 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 			eventsSinceLastStats++
 			r.mu.Unlock()
 
+			// Track cumulative events and the newest event's oplog time for the
+			// console live rows + lag calculation (atomic; read by reportLiveLoop).
+			atomic.AddInt64(&r.liveEvents, 1)
+			var evUnix int64
+			if op.Timestamp != 0 {
+				evUnix = int64(uint32(op.Timestamp >> 32))
+				atomic.StoreInt64(&r.lastEventUnix, evUnix)
+			}
+			// Per-collection counters so the console shows one live row per
+			// collection (whichever collection is actually receiving changes)
+			// instead of a single "增量汇总" aggregate.
+			r.trackLiveEvent(op.Namespace, evUnix)
+
 			// Periodic checkpoint
 			r.mu.Lock()
 			shouldCheckpoint := processedCount >= r.config.SaveThreshold || time.Since(lastCheckpoint) >= time.Duration(r.config.CheckpointIntervalMinutes)*time.Minute
@@ -981,6 +1113,91 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 			}
 
 			return nil
+		}
+	}
+}
+
+// trackLiveEvent increments the per-collection incremental counters for the
+// given oplog namespace ("db.collection"). Namespaces that don't split cleanly
+// (e.g. command ops) are ignored for the per-collection view. evUnix is the
+// event's oplog seconds (0 if unknown).
+func (r *OplogReplicatorLegacy) trackLiveEvent(namespace string, evUnix int64) {
+	parts := strings.SplitN(namespace, ".", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return
+	}
+	v, ok := r.liveStats.Load(namespace)
+	if !ok {
+		v, _ = r.liveStats.LoadOrStore(namespace, &liveCollStat{db: parts[0], coll: parts[1]})
+	}
+	st := v.(*liveCollStat)
+	atomic.AddInt64(&st.events, 1)
+	if evUnix > 0 {
+		atomic.StoreInt64(&st.lastEventUnix, evUnix)
+	}
+}
+
+// reportLiveLoop streams one incremental (增量) progress row per collection to
+// the web console every 2 seconds: cumulative events applied, current
+// events/sec, and the replication lag (tailer's newest consumed oplog position
+// minus that collection's newest applied event). Only collections that have actually
+// received changes appear. Exits when ctx is cancelled; only started when a
+// console is attached.
+func (r *OplogReplicatorLegacy) reportLiveLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	prevEvents := make(map[string]int64)
+	prevT := time.Now()
+
+	// Deferred index build: indexes are built only once the live catch-up burst has
+	// drained (lag settled). The per-cycle worst lag is fed to the shared
+	// DeferredIndexController, which owns the threshold/streak/once logic — the very
+	// same code the modern change-stream path uses, so the two cannot drift.
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			dt := now.Sub(prevT).Seconds()
+			// Worst per-collection lag this cycle; -1 (idle/unknown) counts as
+			// caught up. An idle source with no live rows leaves maxLag at -1.
+			maxLag := -1.0
+			r.liveStats.Range(func(key, value interface{}) bool {
+				ns := key.(string)
+				st := value.(*liveCollStat)
+				events := atomic.LoadInt64(&st.events)
+				var rate float64
+				if dt > 0 {
+					rate = float64(events-prevEvents[ns]) / dt
+				}
+				prevEvents[ns] = events
+
+				// Replication lag = how far this collection's newest applied event
+				// trails the tailer's newest CONSUMED oplog position (any namespace,
+				// r.lastEventUnix). Measured against the oplog stream — NOT wall
+				// clock — so a caught-up tailer with no new source writes reports ~0
+				// instead of a gap that grows by one second every second while idle.
+				lag := -1.0
+				if lastEv := atomic.LoadInt64(&st.lastEventUnix); lastEv > 0 {
+					head := atomic.LoadInt64(&r.lastEventUnix)
+					if head < lastEv {
+						head = lastEv // this collection holds the freshest op
+					}
+					lag = float64(head - lastEv)
+				}
+				if lag > maxLag {
+					maxLag = lag
+				}
+				// Legacy path does not track per-collection failed counts; the
+				// console's file-based DLQ view surfaces any errors instead.
+				r.migrator.reportLive(st.db, st.coll, events, 0, rate, lag)
+				return true
+			})
+			prevT = now
+
+			// Build indexes once lag has settled (shared with the modern path).
+			r.deferredIndex.Observe(ctx, maxLag)
 		}
 	}
 }
@@ -1111,11 +1328,37 @@ func (r *OplogReplicatorLegacy) distributeOplogEvent(ctx context.Context, op *gt
 func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair config.DatabasePair) {
 	var indexCount int
 
+	// Always create the _id index on every target collection, independent of
+	// SyncAllIndexes. Firestore does NOT auto-create it (real MongoDB does), so
+	// without this there is no index backing _id lookups/ordering. Idempotent:
+	// skipped when the target already has "_id_".
+	for dbName, colls := range r.collectionMap {
+		for srcColl, tgtColl := range colls {
+			// Apply any rename-collection remediation so indexes land on the SAME
+			// legal target name the data was written to (idempotent).
+			if r.transformer != nil {
+				tgtColl = r.transformer.SanitizeTargetName(dbName, srcColl, tgtColl)
+			}
+			if r.targetHasIndexLegacy(ctx, tgtColl, "_id_") {
+				r.log.Infof("_id index already exists on target collection '%s', skipping", tgtColl)
+				continue
+			}
+			r.log.Infof("Launching async _id index creation on target collection '%s'", tgtColl)
+			r.targetDB.CreateIDIndexAsync(pair.Target.ConnectionString, tgtColl)
+			indexCount++
+		}
+	}
+
 	if pair.Target.SyncAllIndexes {
 		r.log.Info("SyncAllIndexes enabled: launching async index creation (excluding _id_) for all collections")
 
-		for _, colls := range r.collectionMap {
+		for dbName, colls := range r.collectionMap {
 			for srcColl, tgtColl := range colls {
+				// Apply any rename-collection remediation (idempotent) so secondary
+				// indexes land on the same legal target name as the data.
+				if r.transformer != nil {
+					tgtColl = r.transformer.SanitizeTargetName(dbName, srcColl, tgtColl)
+				}
 				mgoIndexes, err := r.sourceDB.ListIndexes(srcColl)
 				if err != nil {
 					r.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", srcColl, err)
@@ -1164,11 +1407,15 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 			continue
 		}
 
-		// Look up target collection name from collectionMap
+		// Look up target collection name from collectionMap, then apply any
+		// rename-collection remediation (idempotent) so indexes match the data.
 		tgtColl := indexConfig.SourceCollection // default same name
-		for _, colls := range r.collectionMap {
+		for dbName, colls := range r.collectionMap {
 			if mapped, ok := colls[indexConfig.SourceCollection]; ok {
 				tgtColl = mapped
+				if r.transformer != nil {
+					tgtColl = r.transformer.SanitizeTargetName(dbName, indexConfig.SourceCollection, tgtColl)
+				}
 				break
 			}
 		}
@@ -1216,7 +1463,23 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 		}
 	}
 
-	r.log.Infof("Launched %d async index creation tasks (legacy mode). Proceeding with data migration.", indexCount)
+	r.log.Infof("Launched %d async index creation tasks (legacy mode).", indexCount)
+}
+
+// targetHasIndexLegacy reports whether the target collection already has an index
+// with the given name. Errors (e.g. collection not yet created) are treated as
+// "no" so the caller attempts creation. Keeps index creation idempotent.
+func (r *OplogReplicatorLegacy) targetHasIndexLegacy(ctx context.Context, collection, indexName string) bool {
+	idxs, err := r.targetDB.ListIndexes(ctx, collection)
+	if err != nil {
+		return false
+	}
+	for _, idx := range idxs {
+		if n, ok := idx["name"].(string); ok && n == indexName {
+			return true
+		}
+	}
+	return false
 }
 
 // convertMgoIndexToModernBsonM converts an mgo.Index to a modern driver bson.M
@@ -1342,4 +1605,46 @@ func convertMgoValue(v interface{}) interface{} {
 		// Return primitive types as-is (string, int, float, bool, time.Time, etc.)
 		return val
 	}
+}
+
+// sourceDocFetcher re-reads one document from the source by _id during retry-dlq
+// source-resync. Returns (doc, true, nil) when the document is found in the
+// source, (nil, false, nil) when the source no longer has it (deleted — treated
+// as resolved and skipped), or (nil, false, err) on a genuine read error (the
+// document is kept in the DLQ so it can be retried again later).
+type sourceDocFetcher func(collection string, id interface{}) (interface{}, bool, error)
+
+// newLegacySourceFetcher opens a legacy (mgo) connection to the source and
+// returns a fetcher plus a close func. Used when the source is an oplog-legacy
+// (MongoDB 3.0/3.2) server the modern driver cannot connect to. The returned
+// documents are converted to modern-driver-compatible types (via
+// convertMgoBSONToInterface) so they can be written straight to the target.
+func newLegacySourceFetcher(connectionString, database string) (sourceDocFetcher, func(), error) {
+	src, err := db.NewMongoDBLegacy(connectionString, database)
+	if err != nil {
+		return nil, nil, err
+	}
+	fetch := func(collection string, id interface{}) (interface{}, bool, error) {
+		var doc bson.M
+		ferr := src.GetCollection(collection).FindId(modernIDToMgo(id)).One(&doc)
+		if ferr == mgo.ErrNotFound {
+			return nil, false, nil
+		}
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		return convertMgoBSONToInterface(doc), true, nil
+	}
+	return fetch, func() { src.Close() }, nil
+}
+
+// modernIDToMgo converts a modern-driver _id value (as decoded from the DLQ file,
+// which is read with the modern bson codec) back into the mgo representation so
+// FindId matches on a legacy source. ObjectIDs need explicit mapping; other
+// primitive types (string, int, etc.) marshal fine under mgo unchanged.
+func modernIDToMgo(id interface{}) interface{} {
+	if oid, ok := id.(primitive.ObjectID); ok {
+		return bson.ObjectId(string(oid[:]))
+	}
+	return id
 }
