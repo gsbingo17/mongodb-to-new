@@ -146,6 +146,215 @@ func BenchmarkNewHashing(b *testing.B) {
 	}
 }
 
+// BenchmarkExtractAndComputeWorkerIndex measures full raw BSON traversal + ID extraction + hashBytes
+func BenchmarkExtractAndComputeWorkerIndex(b *testing.B) {
+	doc := bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "testcoll"},
+		"documentKey":   bson.M{"_id": primitive.NewObjectID()},
+		"fullDocument":  bson.M{"field1": "value1", "field2": 12345},
+	}
+	rawBytes, _ := bson.Marshal(doc)
+	rawEvent := bson.Raw(rawBytes)
+	workerCount := 32
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		docKeyVal, err := rawEvent.LookupErr("documentKey")
+		if err != nil {
+			b.Fatal(err)
+		}
+		docKeyRaw := docKeyVal.Document()
+		docIDVal, err := docKeyRaw.LookupErr("_id")
+		if err != nil {
+			b.Fatal(err)
+		}
+		hash := hashBytes(docIDVal.Value)
+		_ = ((hash % workerCount) + workerCount) % workerCount
+	}
+}
+
+// BenchmarkDirectHandoff1Queue measures concurrent channel handoff through 1 queue (Direct Routing)
+func BenchmarkDirectHandoff1Queue(b *testing.B) {
+	q := make(chan QueueEvent, 8192)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-q:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	event := QueueEvent{}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q <- event
+	}
+	b.StopTimer()
+	cancel()
+	wg.Wait()
+}
+
+// BenchmarkTieredHandoff2Queues measures concurrent channel handoff through 2 queues (IngestQueue per cursor)
+func BenchmarkTieredHandoff2Queues(b *testing.B) {
+	q1 := make(chan QueueEvent, 8192)
+	q2 := make(chan QueueEvent, 8192)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Intermediate dispatcher
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case item := <-q1:
+				q2 <- item
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Worker
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-q2:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	event := QueueEvent{}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q1 <- event
+	}
+	b.StopTimer()
+	cancel()
+	wg.Wait()
+}
+
+// BenchmarkFullPipelineDirectRouting measures end-to-end latency of Option B (Direct Routing):
+// Reader parses raw BSON documentKey, computes workerIndex, and pushes directly to worker channel.
+func BenchmarkFullPipelineDirectRouting(b *testing.B) {
+	doc := bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "testcoll"},
+		"documentKey":   bson.M{"_id": primitive.NewObjectID()},
+		"fullDocument":  bson.M{"field1": "value1", "field2": 12345},
+	}
+	rawBytes, _ := bson.Marshal(doc)
+	rawEvent := bson.Raw(rawBytes)
+	workerCount := 32
+
+	workerQueue := make(chan QueueEvent, 8192)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-workerQueue:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		docKeyVal, _ := rawEvent.LookupErr("documentKey")
+		docKeyRaw := docKeyVal.Document()
+		docIDVal, _ := docKeyRaw.LookupErr("_id")
+		hash := hashBytes(docIDVal.Value)
+		_ = ((hash % workerCount) + workerCount) % workerCount
+
+		workerQueue <- QueueEvent{Event: rawEvent}
+	}
+	b.StopTimer()
+	cancel()
+	wg.Wait()
+}
+
+// BenchmarkFullPipelineTieredRouting measures end-to-end latency of Option A (Tiered IngestQueue per cursor):
+// Reader pushes raw BSON to cursorQueue, dispatcher pops, parses BSON, computes workerIndex, and pushes to worker channel.
+func BenchmarkFullPipelineTieredRouting(b *testing.B) {
+	doc := bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "testcoll"},
+		"documentKey":   bson.M{"_id": primitive.NewObjectID()},
+		"fullDocument":  bson.M{"field1": "value1", "field2": 12345},
+	}
+	rawBytes, _ := bson.Marshal(doc)
+	rawEvent := bson.Raw(rawBytes)
+	workerCount := 32
+
+	cursorQueue := make(chan QueueEvent, 8192)
+	workerQueue := make(chan QueueEvent, 8192)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Intermediate Dispatcher: pops from cursorQueue, parses BSON, computes workerIndex, pushes to workerQueue
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case ev := <-cursorQueue:
+				raw, _ := ev.Event.(bson.Raw)
+				docKeyVal, _ := raw.LookupErr("documentKey")
+				docKeyRaw := docKeyVal.Document()
+				docIDVal, _ := docKeyRaw.LookupErr("_id")
+				hash := hashBytes(docIDVal.Value)
+				_ = ((hash % workerCount) + workerCount) % workerCount
+
+				workerQueue <- ev
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Worker: pops from workerQueue
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-workerQueue:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cursorQueue <- QueueEvent{Event: rawEvent}
+	}
+	b.StopTimer()
+	cancel()
+	wg.Wait()
+}
+
 
 
 func TestPartitionTrackerCorrectness(t *testing.T) {
@@ -676,6 +885,97 @@ func TestIsDuplicateKeyError(t *testing.T) {
 		if res != tc.expected {
 			t.Errorf("isDuplicateKeyError(%d, %q) = %v; want %v", tc.code, tc.msg, res, tc.expected)
 		}
+	}
+}
+
+func TestStreamWorkerRoutePartitioning(t *testing.T) {
+	testCases := []struct {
+		name         string
+		totalStreams int
+		totalWorkers int
+		wantRoutes   []StreamWorkerRoute
+		wantErr      bool
+	}{
+		{
+			name:         "Exact division",
+			totalStreams: 4,
+			totalWorkers: 8,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 2},
+				{BaseWorkerIndex: 2, NumWorkers: 2},
+				{BaseWorkerIndex: 4, NumWorkers: 2},
+				{BaseWorkerIndex: 6, NumWorkers: 2},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Uneven division with remainder",
+			totalStreams: 4,
+			totalWorkers: 10,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 3},
+				{BaseWorkerIndex: 3, NumWorkers: 3},
+				{BaseWorkerIndex: 6, NumWorkers: 2},
+				{BaseWorkerIndex: 8, NumWorkers: 2},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "More streams than workers",
+			totalStreams: 4,
+			totalWorkers: 2,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 1},
+				{BaseWorkerIndex: 1, NumWorkers: 1},
+				{BaseWorkerIndex: 0, NumWorkers: 1},
+				{BaseWorkerIndex: 1, NumWorkers: 1},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Single stream",
+			totalStreams: 1,
+			totalWorkers: 10,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 10},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Zero streams error",
+			totalStreams: 0,
+			totalWorkers: 10,
+			wantErr:      true,
+		},
+		{
+			name:         "Zero workers error",
+			totalStreams: 4,
+			totalWorkers: 0,
+			wantErr:      true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			routes, err := BuildStreamWorkerRoutes(tc.totalStreams, tc.totalWorkers)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(routes) != len(tc.wantRoutes) {
+				t.Fatalf("expected %d routes, got %d", len(tc.wantRoutes), len(routes))
+			}
+			for i, exp := range tc.wantRoutes {
+				if routes[i] != exp {
+					t.Errorf("stream %d route = %+v; want %+v", i, routes[i], exp)
+				}
+			}
+		})
 	}
 }
 
