@@ -53,6 +53,72 @@ type EventDistributor struct {
 	DryRun       bool // Dry run flag
 
 	partitionTracker *PartitionTracker // Thread-safe ack-based progress checkpoint tracker
+	streamRoutes     []StreamWorkerRoute // Precomputed worker routes per stream partition
+}
+
+// StreamWorkerRoute defines the slice of worker indices assigned to a change stream partition.
+type StreamWorkerRoute struct {
+	BaseWorkerIndex int
+	NumWorkers      int
+}
+
+// BuildStreamWorkerRoutes precomputes the routing table for all totalStreams given totalWorkers.
+//
+// Allocation rules:
+// - If totalStreams <= 0: returns an error (change streams are required).
+// - If totalWorkers <= 0: returns an error (workers are required to process writes).
+// - If totalStreams == 1: stream 0 is assigned all totalWorkers [0, totalWorkers).
+// - If totalWorkers < totalStreams: stream i is assigned 1 worker at (i % totalWorkers).
+// - If totalWorkers >= totalStreams: evenly distributes workers using the remainder formula:
+//     base := totalWorkers / totalStreams
+//     rem := totalWorkers % totalStreams
+//   The first `rem` streams get (base + 1) workers, and the remaining streams get `base` workers.
+//   The maximum difference between any two streams is at most 1 worker.
+func BuildStreamWorkerRoutes(totalStreams, totalWorkers int) ([]StreamWorkerRoute, error) {
+	if totalStreams <= 0 {
+		return nil, fmt.Errorf("totalStreams must be positive, got %d", totalStreams)
+	}
+	if totalWorkers <= 0 {
+		return nil, fmt.Errorf("totalWorkers must be positive, got %d", totalWorkers)
+	}
+
+	routes := make([]StreamWorkerRoute, totalStreams)
+	if totalStreams == 1 {
+		routes[0] = StreamWorkerRoute{BaseWorkerIndex: 0, NumWorkers: totalWorkers}
+		return routes, nil
+	}
+
+	if totalWorkers < totalStreams {
+		for i := 0; i < totalStreams; i++ {
+			routes[i] = StreamWorkerRoute{
+				BaseWorkerIndex: i % totalWorkers,
+				NumWorkers:      1,
+			}
+		}
+		return routes, nil
+	}
+
+	base := totalWorkers / totalStreams
+	rem := totalWorkers % totalStreams
+	for i := 0; i < totalStreams; i++ {
+		if i < rem {
+			routes[i] = StreamWorkerRoute{
+				BaseWorkerIndex: i * (base + 1),
+				NumWorkers:      base + 1,
+			}
+		} else {
+			routes[i] = StreamWorkerRoute{
+				BaseWorkerIndex: rem*(base+1) + (i-rem)*base,
+				NumWorkers:      base,
+			}
+		}
+	}
+	return routes, nil
+}
+
+// GetStreamWorkerRoutes returns the precalculated worker routes for all stream partitions
+func (d *EventDistributor) GetStreamWorkerRoutes() []StreamWorkerRoute {
+	return d.streamRoutes
 }
 
 // NewEventDistributor creates a new event distributor
@@ -69,6 +135,11 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 	tracker := NewPartitionTracker(log, resumeTokenPath, checkpointInterval, saveThreshold, len(changeStreams))
 	// Start the periodic checkpoint flush loop
 	tracker.Start(ctx)
+
+	routes, err := BuildStreamWorkerRoutes(len(changeStreams), incrementalWorkerCount)
+	if err != nil {
+		log.Errorf("Invalid stream worker routing configuration: %v", err)
+	}
 
 	return &EventDistributor{
 		workers:                   make([]*Worker, incrementalWorkerCount),
@@ -88,8 +159,9 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		dlq:                       dlq,
 		retryManager:              retryMgr,
 		cfg:                       cfg,
-		incrementalStatsManager:              incrementalStatsManager,
+		incrementalStatsManager:   incrementalStatsManager,
 		partitionTracker:          tracker,
+		streamRoutes:              routes,
 	}
 }
 
@@ -137,8 +209,17 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 }
 
 // Start begins the event distribution process
-// Start begins the event distribution process
 func (d *EventDistributor) Start() error {
+	if len(d.changeStreams) == 0 {
+		return fmt.Errorf("cannot start event distributor: no change streams provided")
+	}
+	if d.incrementalWorkerCount <= 0 {
+		return fmt.Errorf("cannot start event distributor: incrementalWorkerCount must be positive, got %d", d.incrementalWorkerCount)
+	}
+	if len(d.streamRoutes) != len(d.changeStreams) {
+		return fmt.Errorf("cannot start event distributor: stream routes count (%d) does not match change streams count (%d)", len(d.streamRoutes), len(d.changeStreams))
+	}
+
 	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t, changeStreams: %d)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId, len(d.changeStreams))
 
 	// Concurrency Architecture (Sub-Context Coordination for Fail-Fast Partitioning):

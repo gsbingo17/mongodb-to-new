@@ -679,3 +679,94 @@ func TestIsDuplicateKeyError(t *testing.T) {
 	}
 }
 
+func TestStreamWorkerRoutePartitioning(t *testing.T) {
+	testCases := []struct {
+		name         string
+		totalStreams int
+		totalWorkers int
+		wantRoutes   []StreamWorkerRoute
+		wantErr      bool
+	}{
+		{
+			name:         "Exact division",
+			totalStreams: 4,
+			totalWorkers: 8,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 2},
+				{BaseWorkerIndex: 2, NumWorkers: 2},
+				{BaseWorkerIndex: 4, NumWorkers: 2},
+				{BaseWorkerIndex: 6, NumWorkers: 2},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Uneven division with remainder",
+			totalStreams: 4,
+			totalWorkers: 10,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 3},
+				{BaseWorkerIndex: 3, NumWorkers: 3},
+				{BaseWorkerIndex: 6, NumWorkers: 2},
+				{BaseWorkerIndex: 8, NumWorkers: 2},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "More streams than workers",
+			totalStreams: 4,
+			totalWorkers: 2,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 1},
+				{BaseWorkerIndex: 1, NumWorkers: 1},
+				{BaseWorkerIndex: 0, NumWorkers: 1},
+				{BaseWorkerIndex: 1, NumWorkers: 1},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Single stream",
+			totalStreams: 1,
+			totalWorkers: 10,
+			wantRoutes: []StreamWorkerRoute{
+				{BaseWorkerIndex: 0, NumWorkers: 10},
+			},
+			wantErr: false,
+		},
+		{
+			name:         "Zero streams error",
+			totalStreams: 0,
+			totalWorkers: 10,
+			wantErr:      true,
+		},
+		{
+			name:         "Zero workers error",
+			totalStreams: 4,
+			totalWorkers: 0,
+			wantErr:      true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			routes, err := BuildStreamWorkerRoutes(tc.totalStreams, tc.totalWorkers)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(routes) != len(tc.wantRoutes) {
+				t.Fatalf("expected %d routes, got %d", len(tc.wantRoutes), len(routes))
+			}
+			for i, exp := range tc.wantRoutes {
+				if routes[i] != exp {
+					t.Errorf("stream %d route = %+v; want %+v", i, routes[i], exp)
+				}
+			}
+		})
+	}
+}
+
