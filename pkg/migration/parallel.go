@@ -5,9 +5,8 @@ Pipeline Architecture & Thread Lifecycle Map (Who Produces & Consumes):
 
 | Queue Stage     | Added to by (Producers)                                 | Removed from by (Consumers)                               | Role in the Pipeline |
 | :-------------- | :------------------------------------------------------ | :-------------------------------------------------------- | :------------------- |
-| ingestQueue     | source readers (1 per change stream source)             | partition router (1 central thread)                       | Buffers raw change stream events fetched from TCP sockets, waiting to be sorted and partitioned. |
-| batchingQueue   | partition router (1 central thread)                       | transformer and batcher (1 per active worker)             | Buffers partitioned events routed to a specific worker, waiting to be batched and grouped. |
-| batchWriteQueue | transformer and batcher (1 per active worker)             | target writers (1 per active worker)                       | Buffers finalized, ready-to-write batch task payloads (OperationGroup), waiting to be committed to target DB. |
+| batchingQueue   | change stream readers (1 per change stream partition)   | transformer and batcher (1 per active worker)             | Buffers partitioned events routed directly to a specific worker, waiting to be batched and grouped. |
+| batchWriteQueue | transformer and batcher (1 per active worker)           | target writers (1 per active worker)                      | Buffers finalized, ready-to-write batch task payloads (OperationGroup), waiting to be committed to target DB. |
 */
 
 import (
@@ -293,7 +292,7 @@ func (d *EventDistributor) Start() error {
 	// Ensure all workers are shut down sequentially and safely upon exit
 	defer func() {
 		if d.incrementalStatsManager != nil {
-			d.incrementalStatsManager.RegisterQueues(nil, nil)
+			d.incrementalStatsManager.RegisterQueues(nil)
 		}
 		d.log.Info("Shutting down workers...")
 		for _, worker := range d.workers {
@@ -307,22 +306,21 @@ func (d *EventDistributor) Start() error {
 		}
 	}()
 
-	// Ingest queue for concurrent reader threads to publish events.
-	// Capacity scales with the number of streams to avoid memory lockups and hold multiple batches safely.
-	ingestQueue := make(chan QueueEvent, d.cfg.IncrementalIncomingQueueSize*len(d.changeStreams))
 	if d.incrementalStatsManager != nil {
-		d.incrementalStatsManager.RegisterQueues(d.workers, ingestQueue)
+		d.incrementalStatsManager.RegisterQueues(d.workers)
 	}
 	var readerWg sync.WaitGroup
 
-	// Spawn concurrent background reader threads (Producer routines) for each sharded change stream.
-	// This implements Asynchronous Prefetching (overlapping CPU allocation/routing and Network I/O):
-	// while the distributor is routing batch A, these background loops are already prefetching batch B
-	// over their respective TCP sockets, delivering a massive throughput/WPS scale-out!
+	// Spawn concurrent reader goroutines (one per change stream cursor).
+	// Each reader extracts the documentKey._id and dispatches events directly
+	// into the target worker's batchingQueue. This completely eliminates the
+	// single-threaded central ingestQueue bottleneck.
 	for idx, stream := range d.changeStreams {
 		readerWg.Add(1)
 		go func(streamIndex int, changeStream *mongo.ChangeStream) {
 			defer readerWg.Done()
+
+			route := d.streamRoutes[streamIndex]
 
 			for {
 				// Block on network socket until the next batch is fetched/returned by the driver
@@ -378,15 +376,70 @@ func (d *EventDistributor) Start() error {
 					seqNum = d.partitionTracker.Register(streamIndex, resumeToken, eventTime)
 				}
 
-				event := QueueEvent{
-					Event:       rawCopy,
-					ReadTime:    readTime,
-					StreamIndex: streamIndex,
-					SeqNum:      seqNum,
+				// Non-DML / Control Event Graceful Filtering (Prevent Log Pollution):
+				// Change streams report DDL/system events (like drops, invalidations, index changes) that do not have
+				// a documentKey payload. We identify these via fast BSON type-validated binary lookup.
+				// Safety Boundary: If the event is a collection drop ("drop"), we treat it as a terminal failure to prevent silent data loss.
+				// For other harmless/unsupported non-DML events, we skip them cleanly with partition progress sequence ACKs.
+				opTypeVal, err := rawCopy.LookupErr("operationType")
+				if err == nil && opTypeVal.Type == bson.TypeString {
+					opType := opTypeVal.StringValue()
+					if opType == "drop" {
+						var nsCtx string
+						if ns := ExtractNamespaceFromRawEvent(rawCopy); ns != "" {
+							nsCtx = " " + ns
+						}
+						d.log.Errorf("Collection drop detected in partition %d%s", streamIndex, nsCtx)
+						setError(fmt.Errorf("terminal failure: collection drop event detected in partition %d%s", streamIndex, nsCtx))
+						return
+					}
+					if opType != "insert" && opType != "update" && opType != "replace" && opType != "delete" {
+						d.log.Warnf("Skipping unsupported change stream event type %q", opType)
+						if d.incrementalStatsManager != nil {
+							d.incrementalStatsManager.RecordSkippedEvent(opType)
+						}
+						if d.partitionTracker != nil {
+							d.partitionTracker.Ack(streamIndex, seqNum)
+						}
+						continue
+					}
 				}
 
+				// Determine target worker index deterministically based on partition route
+				var workerIndex int
+				if route.NumWorkers == 1 {
+					// 1:1 or N:1 mapping fast path: skip BSON ID extraction and hashing entirely (0 ns calculation)
+					workerIndex = route.BaseWorkerIndex
+				} else {
+					// 1:N mapping: extract documentKey._id and hash across the route's worker sub-pool
+					workerOffset, err := ExtractWorkerIndexFromRawEvent(rawCopy, route.NumWorkers)
+					if err != nil {
+						d.log.Errorf("[Reader %d] Invalid raw change event: %v", streamIndex, err)
+						if d.partitionTracker != nil {
+							d.partitionTracker.Ack(streamIndex, seqNum)
+						}
+						continue
+					}
+					workerIndex = route.BaseWorkerIndex + workerOffset
+				}
+
+				event := QueueEvent{
+					Event:               rawCopy,
+					ReadTime:            readTime,
+					DistributorTime:     readTime,
+					DistributorPushTime: time.Now(),
+					StreamIndex:         streamIndex,
+					SeqNum:              seqNum,
+				}
+
+				// Dispatch event directly to the target worker channel
+				pushStart := time.Now()
 				select {
-				case ingestQueue <- event:
+				case d.workers[workerIndex].batchingQueue <- event:
+					stall := time.Since(pushStart)
+					if stall > 1*time.Millisecond && d.incrementalStatsManager != nil {
+						d.incrementalStatsManager.RecordBatchingQueueStall(stall)
+					}
 				case <-cancelCtx.Done():
 					if d.partitionTracker != nil {
 						d.partitionTracker.Ack(streamIndex, seqNum)
@@ -397,98 +450,19 @@ func (d *EventDistributor) Start() error {
 		}(idx, stream)
 	}
 
-	// Spin up cleanup supervisor to close the queue once all threads have terminated
+	// Wait for all reader threads to complete or for cancellation to terminate the pipeline
+	readersDone := make(chan struct{})
 	go func() {
 		readerWg.Wait()
-		close(ingestQueue)
+		close(readersDone)
 	}()
 
-	// Main loop (Consumer routine) to distribute events from the shared pre-fetched queue to workers.
-	// Since background threads keep this shared queue populated, the main distributor thread loop
-	// experiences near-zero wait I/O delay and can route events lock-freely at top speeds!
-	for {
-		select {
-		case event, ok := <-ingestQueue:
-			if !ok {
-				// All reader threads completed. If there was a termination error, return it!
-				if termErr != nil {
-					return termErr
-				}
-				return nil
-			}
-			event.DistributorTime = time.Now()
-
-			rawEvent, ok := event.Event.(bson.Raw)
-			if !ok {
-				if d.partitionTracker != nil {
-					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-				}
-				continue
-			}
-
-			// Non-DML / Control Event Graceful Filtering (Prevent Log Pollution):
-			// Change streams report DDL/system events (like drops, invalidations, index changes) that do not have
-			// a documentKey payload. We identify these via fast BSON type-validated binary lookup.
-			// Safety Boundary: If the event is a collection drop ("drop"), we treat it as a terminal failure to prevent silent data loss.
-			// For other harmless/unsupported non-DML events, we skip them cleanly with partition progress sequence ACKs.
-			opTypeVal, err := rawEvent.LookupErr("operationType")
-			if err == nil && opTypeVal.Type == bson.TypeString {
-				opType := opTypeVal.StringValue()
-				if opType == "drop" {
-					var nsCtx string
-					if ns := ExtractNamespaceFromRawEvent(rawEvent); ns != "" {
-						nsCtx = " " + ns
-					}
-					return fmt.Errorf("terminal failure: collection drop event detected in partition %d%s", event.StreamIndex, nsCtx)
-				}
-				if opType != "insert" && opType != "update" && opType != "replace" && opType != "delete" {
-					d.log.Warnf("Skipping unsupported change stream event type %q", opType)
-					if d.incrementalStatsManager != nil {
-						d.incrementalStatsManager.RecordSkippedEvent(opType)
-					}
-					if d.partitionTracker != nil {
-						d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-					}
-					continue
-				}
-			}
-
-			// Determine worker index deterministically from raw change event
-			workerIndex, err := ExtractWorkerIndexFromRawEvent(rawEvent, d.incrementalWorkerCount)
-			if err != nil {
-				d.log.Errorf("Invalid raw change event: %v", err)
-				if d.partitionTracker != nil {
-					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-				}
-				continue
-			}
-
-			// Dispatch event to the target worker channel
-			event.DistributorPushTime = time.Now()
-			pushStart := time.Now()
-			select {
-			case d.workers[workerIndex].batchingQueue <- event:
-				stall := time.Since(pushStart)
-				if stall > 1*time.Millisecond && d.incrementalStatsManager != nil {
-					d.incrementalStatsManager.RecordBatchingQueueStall(stall)
-				}
-			case <-cancelCtx.Done():
-				if d.partitionTracker != nil {
-					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-				}
-				if termErr != nil {
-					return termErr
-				}
-				return nil
-			}
-
-		case <-cancelCtx.Done():
-			if termErr != nil {
-				return termErr
-			}
-			return nil
-		}
+	select {
+	case <-readersDone:
+	case <-cancelCtx.Done():
+		<-readersDone
 	}
+	return termErr
 }
 
 // saveResumeToken is left as a legacy stub for single-stream compatibility

@@ -968,3 +968,49 @@ func TestStreamWorkerRoutePartitioning(t *testing.T) {
 	}
 }
 
+func TestExtractWorkerIndexFromRawEvent(t *testing.T) {
+	oid := primitive.NewObjectID()
+	doc := bson.M{
+		"operationType": "insert",
+		"documentKey":   bson.M{"_id": oid},
+	}
+	rawBytes, err := bson.Marshal(doc)
+	if err != nil {
+		t.Fatalf("failed to marshal BSON: %v", err)
+	}
+	rawEvent := bson.Raw(rawBytes)
+
+	// Test deterministic worker index within bounds [0, numWorkers)
+	numWorkers := 8
+	idx1, err := ExtractWorkerIndexFromRawEvent(rawEvent, numWorkers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if idx1 < 0 || idx1 >= numWorkers {
+		t.Errorf("worker index out of bounds: got %d, want in [0, %d)", idx1, numWorkers)
+	}
+
+	// Repeated calls must produce the exact same index
+	idx2, err := ExtractWorkerIndexFromRawEvent(rawEvent, numWorkers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if idx1 != idx2 {
+		t.Errorf("expected deterministic index, got %d and %d", idx1, idx2)
+	}
+
+	// Test missing documentKey
+	noDocKey, _ := bson.Marshal(bson.M{"operationType": "insert"})
+	_, err = ExtractWorkerIndexFromRawEvent(bson.Raw(noDocKey), numWorkers)
+	if err == nil {
+		t.Errorf("expected error for missing documentKey, got nil")
+	}
+
+	// Test missing _id in documentKey
+	noID, _ := bson.Marshal(bson.M{"operationType": "insert", "documentKey": bson.M{"foo": "bar"}})
+	_, err = ExtractWorkerIndexFromRawEvent(bson.Raw(noID), numWorkers)
+	if err == nil {
+		t.Errorf("expected error for missing _id, got nil")
+	}
+}
+

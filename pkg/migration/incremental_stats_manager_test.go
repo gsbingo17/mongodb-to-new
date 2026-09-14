@@ -537,7 +537,7 @@ func TestIncrementalStatsManagerQueueObservability(t *testing.T) {
 	sm.RecordQueueDelays(5*time.Millisecond, 12*time.Millisecond)
 
 	// Register empty/nil channels to verify no panics
-	sm.RegisterQueues(nil, nil)
+	sm.RegisterQueues(nil)
 
 	// Read and reset stats
 	batchingStall := atomic.LoadInt64(&sm.batchingQueueStallNs)
