@@ -160,17 +160,10 @@ func BenchmarkExtractAndComputeWorkerIndex(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		docKeyVal, err := rawEvent.LookupErr("documentKey")
+		_, err := ExtractWorkerIndexFromRawEvent(rawEvent, workerCount)
 		if err != nil {
 			b.Fatal(err)
 		}
-		docKeyRaw := docKeyVal.Document()
-		docIDVal, err := docKeyRaw.LookupErr("_id")
-		if err != nil {
-			b.Fatal(err)
-		}
-		hash := hashBytes(docIDVal.Value)
-		_ = ((hash % workerCount) + workerCount) % workerCount
 	}
 }
 
@@ -249,7 +242,7 @@ func BenchmarkTieredHandoff2Queues(b *testing.B) {
 }
 
 // BenchmarkFullPipelineDirectRouting measures end-to-end latency of Option B (Direct Routing):
-// Reader parses raw BSON documentKey, computes workerIndex, and pushes directly to worker channel.
+// Reader parses raw BSON documentKey using ExtractWorkerIndexFromRawEvent and pushes directly to worker channel.
 func BenchmarkFullPipelineDirectRouting(b *testing.B) {
 	doc := bson.M{
 		"operationType": "insert",
@@ -280,12 +273,10 @@ func BenchmarkFullPipelineDirectRouting(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		docKeyVal, _ := rawEvent.LookupErr("documentKey")
-		docKeyRaw := docKeyVal.Document()
-		docIDVal, _ := docKeyRaw.LookupErr("_id")
-		hash := hashBytes(docIDVal.Value)
-		_ = ((hash % workerCount) + workerCount) % workerCount
-
+		_, err := ExtractWorkerIndexFromRawEvent(rawEvent, workerCount)
+		if err != nil {
+			b.Fatal(err)
+		}
 		workerQueue <- QueueEvent{Event: rawEvent}
 	}
 	b.StopTimer()
@@ -294,7 +285,7 @@ func BenchmarkFullPipelineDirectRouting(b *testing.B) {
 }
 
 // BenchmarkFullPipelineTieredRouting measures end-to-end latency of Option A (Tiered IngestQueue per cursor):
-// Reader pushes raw BSON to cursorQueue, dispatcher pops, parses BSON, computes workerIndex, and pushes to worker channel.
+// Reader pushes raw BSON to cursorQueue, dispatcher pops, calls ExtractWorkerIndexFromRawEvent, and pushes to worker channel.
 func BenchmarkFullPipelineTieredRouting(b *testing.B) {
 	doc := bson.M{
 		"operationType": "insert",
@@ -314,19 +305,17 @@ func BenchmarkFullPipelineTieredRouting(b *testing.B) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Intermediate Dispatcher: pops from cursorQueue, parses BSON, computes workerIndex, pushes to workerQueue
+	// Intermediate Dispatcher: pops from cursorQueue, calls ExtractWorkerIndexFromRawEvent, pushes to workerQueue
 	go func() {
 		defer wg.Done()
 		for {
 			select {
 			case ev := <-cursorQueue:
 				raw, _ := ev.Event.(bson.Raw)
-				docKeyVal, _ := raw.LookupErr("documentKey")
-				docKeyRaw := docKeyVal.Document()
-				docIDVal, _ := docKeyRaw.LookupErr("_id")
-				hash := hashBytes(docIDVal.Value)
-				_ = ((hash % workerCount) + workerCount) % workerCount
-
+				_, err := ExtractWorkerIndexFromRawEvent(raw, workerCount)
+				if err != nil {
+					b.Errorf("failed to extract worker index: %v", err)
+				}
 				workerQueue <- ev
 			case <-ctx.Done():
 				return

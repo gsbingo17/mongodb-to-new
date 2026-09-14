@@ -208,6 +208,23 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 	return ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 }
 
+// ExtractWorkerIndexFromRawEvent extracts documentKey._id from raw BSON bytes,
+// hashes the binary ID using FNV-1a, and computes the worker index within numWorkers.
+func ExtractWorkerIndexFromRawEvent(rawEvent bson.Raw, numWorkers int) (int, error) {
+	docKeyVal, err := rawEvent.LookupErr("documentKey")
+	if err != nil {
+		return 0, fmt.Errorf("missing documentKey: %w", err)
+	}
+	docKeyRaw := docKeyVal.Document()
+	docIDVal, err := docKeyRaw.LookupErr("_id")
+	if err != nil {
+		return 0, fmt.Errorf("missing documentKey._id: %w", err)
+	}
+
+	hash := hashBytes(docIDVal.Value)
+	return ((hash % numWorkers) + numWorkers) % numWorkers, nil
+}
+
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
 	if len(d.changeStreams) == 0 {
@@ -436,28 +453,15 @@ func (d *EventDistributor) Start() error {
 				}
 			}
 
-			// Extract documentKey._id via fast binary lookup
-			docKeyVal, err := rawEvent.LookupErr("documentKey")
+			// Determine worker index deterministically from raw change event
+			workerIndex, err := ExtractWorkerIndexFromRawEvent(rawEvent, d.incrementalWorkerCount)
 			if err != nil {
-				d.log.Errorf("Invalid raw change event: missing documentKey")
+				d.log.Errorf("Invalid raw change event: %v", err)
 				if d.partitionTracker != nil {
 					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
 				}
 				continue
 			}
-			docKeyRaw := docKeyVal.Document()
-			docIDVal, err := docKeyRaw.LookupErr("_id")
-			if err != nil {
-				d.log.Errorf("Invalid raw change event: missing documentKey._id")
-				if d.partitionTracker != nil {
-					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-				}
-				continue
-			}
-
-			// Determine worker index deterministically by key hashing
-			hash := hashBytes(docIDVal.Value)
-			workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 
 			// Dispatch event to the target worker channel
 			event.DistributorPushTime = time.Now()
