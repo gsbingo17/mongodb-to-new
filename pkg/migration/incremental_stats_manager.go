@@ -135,9 +135,8 @@ type IncrementalStatsManager struct {
 	targetPool poolMonitorStats
 
 	// Queue snapshot support (protected by mu lock)
-	workers     []*Worker
-	ingestQueue chan QueueEvent
-	dlq         DLQ
+	workers []*Worker
+	dlq     DLQ
 
 	// Stall / Backpressure stats (atomically tracked)
 	batchingQueueStallNs   int64
@@ -160,15 +159,14 @@ func (sm *IncrementalStatsManager) SetDLQ(dlq DLQ) {
 	sm.dlq = dlq
 }
 
-// RegisterQueues registers the worker pool and ingest queue for monitoring in the IncrementalStatsManager
-func (sm *IncrementalStatsManager) RegisterQueues(workers []*Worker, ingestQueue chan QueueEvent) {
+// RegisterQueues registers the active worker pool for monitoring in the IncrementalStatsManager
+func (sm *IncrementalStatsManager) RegisterQueues(workers []*Worker) {
 	if sm == nil {
 		return
 	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.workers = workers
-	sm.ingestQueue = ingestQueue
 }
 
 // RecordBatchingQueueStall increments the cumulative distributor channel block stall duration
@@ -205,7 +203,6 @@ func (sm *IncrementalStatsManager) getQueueDepthsSnapshot() string {
 	}
 	sm.mu.Lock()
 	workers := sm.workers
-	ingestQueue := sm.ingestQueue
 	sm.mu.Unlock()
 
 	if len(workers) == 0 {
@@ -240,11 +237,6 @@ func (sm *IncrementalStatsManager) getQueueDepthsSnapshot() string {
 		}
 	}
 
-	ingestUtil := 0.0
-	if ingestQueue != nil && cap(ingestQueue) > 0 {
-		ingestUtil = float64(len(ingestQueue)) / float64(cap(ingestQueue)) * 100
-	}
-
 	avgBatchingUtil := 0.0
 	if totalBatchingCap > 0 {
 		avgBatchingUtil = float64(totalBatchingLen) / float64(totalBatchingCap) * 100
@@ -256,8 +248,8 @@ func (sm *IncrementalStatsManager) getQueueDepthsSnapshot() string {
 	}
 
 	return fmt.Sprintf(
-		"Ingest: %.1f%% | Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
-		ingestUtil, avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
+		"Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
+		avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
 	)
 }
 
