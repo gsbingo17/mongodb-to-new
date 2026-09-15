@@ -779,6 +779,13 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
 	}
 
+	if plan.IsCompleted() {
+		docs := plan.TotalDocsMigrated()
+		m.log.Infof("[%s.%s] Sequential initial backfill already completed in previous run (~%d documents). Skipping.",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
+		return docs, 0, nil
+	}
+
 	switch plan.Mode {
 	case ResumptionModeDirect:
 		checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, totalSplits)
@@ -1095,11 +1102,9 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			collConfig.SourceCollection, migratedCount)
 	}
 
-	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
+	// Mark backfill checkpoint as completed and retain it on disk so subsequent resumption runs know this collection finished.
+	// If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
 	tracker.MarkCompleted()
-	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
-		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
-	}
 	return successCount, failedCount, nil
 }
 
@@ -1240,6 +1245,13 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	if err != nil {
 		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
+	}
+
+	if plan.IsCompleted() {
+		docs := plan.TotalDocsMigrated()
+		m.log.Infof("[%s.%s] Parallel initial backfill already completed in previous run (~%d documents). Skipping.",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
+		return docs, 0, nil
 	}
 
 	var partitions []bson.D
@@ -1689,11 +1701,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			collConfig.SourceCollection, migratedCount)
 	}
 
-	// Always clean up backfill checkpoints when the full collection scan completes.
-	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
-		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
-	}
-
+	// Retain completed partition checkpoints on disk so subsequent resumption runs know this collection finished.
 	return successCount, failedCount, nil
 }
 

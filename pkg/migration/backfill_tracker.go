@@ -201,6 +201,9 @@ func (t *BackfillPartitionTracker) saveCheckpointsLocked() {
 		}
 		candidate.ApproximateDocsMigrated += totalSucceeded
 		candidate.UpdatedAt = time.Now().UTC()
+		if t.completed {
+			candidate.Completed = true
+		}
 	}
 
 	if t.checkpointPath != "" && candidate != nil {
@@ -234,6 +237,7 @@ func cloneCheckpoint(cp *PartitionCheckpoint) *PartitionCheckpoint {
 		TotalSplits:             cp.TotalSplits,
 		ApproximateDocsMigrated: cp.ApproximateDocsMigrated,
 		UpdatedAt:               cp.UpdatedAt,
+		Completed:               cp.Completed,
 		TypeProgress:            make(map[BSONType]*TypeRangeBoundary, len(cp.TypeProgress)),
 	}
 	for k, v := range cp.TypeProgress {

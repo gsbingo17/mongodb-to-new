@@ -274,20 +274,32 @@ func TestMigrator_SequentialResumption_CleanupOnCompletion(t *testing.T) {
 		t.Fatalf("checkpoint file should exist before cleanup")
 	}
 
-	// Simulate migrateCollection finishing: MarkCompleted followed by DeletePartitionCheckpoints
+	// Simulate migrateCollection finishing: MarkCompleted retains checkpoint on disk with Completed = true
 	tracker.MarkCompleted()
-	if err := DeletePartitionCheckpoints(tmpDir, dbName, collName); err != nil {
-		t.Fatalf("failed to delete partition checkpoints: %v", err)
-	}
-
-	// Simulate deferred tracker.Close() running on function exit
 	tracker.Close()
 
-	if _, err := os.Stat(checkpointPath); !os.IsNotExist(err) {
-		t.Fatalf("checkpoint file should have remained deleted and not resurrected by Close()")
+	if _, err := os.Stat(checkpointPath); os.IsNotExist(err) {
+		t.Fatalf("checkpoint file should be retained on disk after completion")
 	}
-	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
-		t.Fatalf("temporary checkpoint file should have been deleted")
+
+	loadedCP, err := LoadPartitionCheckpoint(checkpointPath)
+	if err != nil || loadedCP == nil {
+		t.Fatalf("failed to load completed checkpoint: %v", err)
+	}
+	if !loadedCP.IsCompleted() {
+		t.Errorf("expected loaded checkpoint to have Completed == true")
+	}
+
+	// Resumption plan should recognize completion and mark AllCompleted
+	plan, err := DetermineBackfillResumptionPlan(tmpDir, dbName, collName, 1)
+	if err != nil {
+		t.Fatalf("unexpected error determining resumption plan: %v", err)
+	}
+	if !plan.IsCompleted() {
+		t.Errorf("expected plan.IsCompleted() to be true")
+	}
+	if !plan.AllCompleted {
+		t.Errorf("expected plan.AllCompleted to be true")
 	}
 }
 

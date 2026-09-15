@@ -50,6 +50,12 @@ type PartitionCheckpoint struct {
 	TypeProgress            map[BSONType]*TypeRangeBoundary `bson:"typeProgress" json:"typeProgress"`
 	ApproximateDocsMigrated int64                           `bson:"approximateDocsMigrated" json:"approximateDocsMigrated"`
 	UpdatedAt               time.Time                       `bson:"updatedAt" json:"updatedAt"`
+	Completed               bool                            `bson:"completed,omitempty" json:"completed,omitempty"`
+}
+
+// IsCompleted returns whether this partition checkpoint has finished its scan completely.
+func (cp *PartitionCheckpoint) IsCompleted() bool {
+	return cp != nil && cp.Completed
 }
 
 // getCollectionPartitionPrefix returns the standard filename prefix for a given database and collection partition checkpoint.
