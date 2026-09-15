@@ -897,6 +897,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 	var mu sync.Mutex                 // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
 
+	// proactiveSkipEnabled is an optimization flag dynamically enabled when an entire batch fails
+	// with duplicate key errors (code 11000), typically when traversing through already-migrated documents
+	// during backfill resumption. When true, workers proactively query the target collection for existing
+	// document IDs (_id: {$in: ids}) and skip them before attempting bulk inserts, avoiding heavy retry overhead.
 	proactiveSkipEnabled := &atomic.Bool{}
 
 	// Start worker pool for parallel batch processing
@@ -1474,6 +1478,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		go func(partitionIndex int, filter bson.D, checkpoint *PartitionCheckpoint) {
 			defer wg.Done()
 
+			if checkpoint.IsCompleted() {
+				m.log.Infof("[%s.%s] Partition %d/%d already completed in previous run (~%d documents). Skipping.",
+					sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex+1, len(partitions), checkpoint.ApproximateDocsMigrated)
+				return
+			}
+
 			m.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
 
 			checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, len(partitions))
@@ -1508,6 +1518,10 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				workerCount = 1 // Ensure at least 1 worker per partition
 			}
 
+			// proactiveSkipEnabled is an optimization flag dynamically enabled when an entire batch fails
+			// with duplicate key errors (code 11000), typically when traversing through already-migrated documents
+			// during backfill resumption. When true, workers proactively query the target collection for existing
+			// document IDs (_id: {$in: ids}) and skip them before attempting bulk inserts, avoiding heavy retry overhead.
 			proactiveSkipEnabled := &atomic.Bool{}
 
 			m.log.Debugf("Starting %d workers for partition %d", workerCount, partitionIndex)

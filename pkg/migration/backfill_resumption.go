@@ -235,6 +235,9 @@ func ExtractGlobalMinSafeIDs(checkpoints []*PartitionCheckpoint) (map[BSONType]a
 		if cp == nil {
 			return nil, fmt.Errorf("checkpoint at index %d is nil", i)
 		}
+		if cp.Completed {
+			continue
+		}
 		for typeName, boundary := range cp.TypeProgress {
 			if boundary == nil {
 				continue

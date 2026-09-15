@@ -1061,4 +1061,66 @@ func TestBackfillResumption_DetermineBackfillResumptionPlan(t *testing.T) {
 			t.Errorf("expected plan.AllCompleted to be true")
 		}
 	})
+
+	t.Run("HistoricalPartitionsPartialCompleted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		db := "test_db"
+		coll := "test_coll"
+		totalSplits := 2
+
+		oidMid, _ := primitive.ObjectIDFromHex("60a000000000000000000050")
+		oidSaved, _ := primitive.ObjectIDFromHex("60a000000000000000000070")
+
+		cp0 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          0,
+			TotalSplits:             totalSplits,
+			ApproximateDocsMigrated: 500,
+			Completed:               true,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeEndID: oidMid},
+			},
+		}
+
+		cp1 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          1,
+			TotalSplits:             totalSplits,
+			ApproximateDocsMigrated: 200,
+			Completed:               false,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeObjectID: {
+					BSONType:     BSONTypeObjectID,
+					RangeStartID: oidMid,
+					SavedLastID:  oidSaved,
+				},
+			},
+		}
+
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 0, totalSplits), cp0)
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 1, totalSplits), cp1)
+
+		// Ask with a DIFFERENT partition count (e.g. 4)
+		plan, err := DetermineBackfillResumptionPlan(tmpDir, db, coll, 4)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if plan.Mode != ResumptionModeResampleWithGlobalMin {
+			t.Fatalf("expected plan.Mode to be ResumptionModeResampleWithGlobalMin, got %v", plan.Mode)
+		}
+		if plan.IsCompleted() {
+			t.Errorf("expected plan.IsCompleted() to be false for partial historical completed set")
+		}
+		if plan.AllCompleted {
+			t.Errorf("expected plan.AllCompleted to be false")
+		}
+		if plan.GlobalMinSafeIDs[BSONTypeObjectID] != oidSaved {
+			t.Errorf("expected GlobalMinSafeIDs[BSONTypeObjectID] to be %v, got %v", oidSaved, plan.GlobalMinSafeIDs[BSONTypeObjectID])
+		}
+		if totalDocs := plan.TotalDocsMigrated(); totalDocs != 700 {
+			t.Errorf("expected TotalDocsMigrated to be 700, got %d", totalDocs)
+		}
+	})
 }
