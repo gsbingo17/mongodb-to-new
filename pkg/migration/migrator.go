@@ -730,10 +730,6 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		return 0, 0, nil
 	}
 
-	if opts.BackfillStatsManager != nil {
-		opts.BackfillStatsManager.AddTargetCount(totalCount)
-	}
-
 	// If no documents, we're done
 	if totalCount == 0 {
 		m.log.Infof("No documents to migrate for collection %s", collConfig.SourceCollection)
@@ -784,6 +780,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		m.log.Infof("[%s.%s] Sequential initial backfill already completed in previous run (~%d documents). Skipping.",
 			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
 		return docs, 0, nil
+	}
+
+	if opts.BackfillStatsManager != nil {
+		opts.BackfillStatsManager.AddTargetCount(totalCount)
 	}
 
 	switch plan.Mode {
@@ -1252,6 +1252,10 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		m.log.Infof("[%s.%s] Parallel initial backfill already completed in previous run (~%d documents). Skipping.",
 			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
 		return docs, 0, nil
+	}
+
+	if opts.BackfillStatsManager != nil {
+		opts.BackfillStatsManager.AddTargetCount(totalCount)
 	}
 
 	var partitions []bson.D
