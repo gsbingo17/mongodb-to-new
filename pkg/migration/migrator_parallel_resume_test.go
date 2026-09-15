@@ -393,24 +393,27 @@ func TestMigrator_ParallelResumption_CleanupOnCompletion(t *testing.T) {
 		tracker.Close()
 	}
 
-	// Verify files exist before deletion
+	// Verify partition checkpoint files exist on disk with Completed = true
 	cps, err := ListPartitionCheckpoints(tmpDir, dbName, collName)
 	if err != nil || len(cps) != totalSplits {
-		t.Fatalf("expected %d checkpoints before deletion, got %d (err: %v)", totalSplits, len(cps), err)
+		t.Fatalf("expected %d checkpoints after completion, got %d (err: %v)", totalSplits, len(cps), err)
+	}
+	for i, cp := range cps {
+		if !cp.IsCompleted() {
+			t.Errorf("expected partition %d to have Completed == true", i)
+		}
 	}
 
-	// Delete on successful collection migration
-	if err := DeletePartitionCheckpoints(tmpDir, dbName, collName); err != nil {
-		t.Fatalf("failed to delete checkpoints: %v", err)
-	}
-
-	// Verify files are cleaned up
-	cpsAfter, err := ListPartitionCheckpoints(tmpDir, dbName, collName)
+	// Resumption plan should recognize all partitions completed
+	plan, err := DetermineBackfillResumptionPlan(tmpDir, dbName, collName, totalSplits)
 	if err != nil {
-		t.Fatalf("unexpected error listing checkpoints: %v", err)
+		t.Fatalf("unexpected error determining resumption plan: %v", err)
 	}
-	if len(cpsAfter) != 0 {
-		t.Errorf("expected 0 checkpoints after cleanup, got %d", len(cpsAfter))
+	if !plan.IsCompleted() {
+		t.Errorf("expected plan.IsCompleted() to be true")
+	}
+	if !plan.AllCompleted {
+		t.Errorf("expected plan.AllCompleted to be true")
 	}
 }
 

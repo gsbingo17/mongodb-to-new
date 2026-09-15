@@ -29,6 +29,12 @@ type BackfillResumptionPlan struct {
 	PartitionFilters     []bson.D         // Reconstructed filters when Mode == ResumptionModeDirect
 	PartitionInitialDocs []int64          // Initial document counts per historical partition checkpoint. This will not be provided when Mode == ResumptionModeFresh.
 	GlobalMinSafeIDs     map[BSONType]any // Global min safe IDs per BSON type when Mode == ResumptionModeResampleWithGlobalMin
+	AllCompleted         bool             // True if all partition checkpoints are marked Completed
+}
+
+// IsCompleted returns true if all partition checkpoints in the resumption plan are marked completed.
+func (p *BackfillResumptionPlan) IsCompleted() bool {
+	return p != nil && p.AllCompleted
 }
 
 // TotalDocsMigrated returns the total sum of documents already migrated across all loaded checkpoints.
@@ -148,6 +154,10 @@ func BuildPartitionFilterFromCheckpoint(cp *PartitionCheckpoint) (bson.D, error)
 	if cp == nil {
 		return nil, fmt.Errorf("cannot build filter from nil checkpoint")
 	}
+	if cp.Completed {
+		// Partition completed in a previous run; match no documents
+		return bson.D{{Key: "_id", Value: bson.D{{Key: "$exists", Value: false}}}}, nil
+	}
 	if len(cp.TypeProgress) == 0 {
 		return nil, fmt.Errorf("cannot build filter from checkpoint with empty type progress (partition %d)", cp.PartitionIndex)
 	}
@@ -224,6 +234,9 @@ func ExtractGlobalMinSafeIDs(checkpoints []*PartitionCheckpoint) (map[BSONType]a
 	for i, cp := range checkpoints {
 		if cp == nil {
 			return nil, fmt.Errorf("checkpoint at index %d is nil", i)
+		}
+		if cp.Completed {
+			continue
 		}
 		for typeName, boundary := range cp.TypeProgress {
 			if boundary == nil {
@@ -436,7 +449,11 @@ func DetermineBackfillResumptionPlan(dir, db, collection string, expectedPartiti
 	if ValidateCheckpointSet(checkpoints, expectedPartitions) {
 		initialDocs := make([]int64, len(checkpoints))
 		filters := make([]bson.D, len(checkpoints))
+		allCompleted := true
 		for i, cp := range checkpoints {
+			if !cp.Completed {
+				allCompleted = false
+			}
 			initialDocs[i] = cp.ApproximateDocsMigrated
 			filter, err := BuildPartitionFilterFromCheckpoint(cp)
 			if err != nil {
@@ -448,14 +465,27 @@ func DetermineBackfillResumptionPlan(dir, db, collection string, expectedPartiti
 			Mode:                 ResumptionModeDirect,
 			PartitionFilters:     filters,
 			PartitionInitialDocs: initialDocs,
+			AllCompleted:         allCompleted,
 		}, nil
 	}
 
 	// If the checkpoint set is complete but the partition count has changed, we need to resample new partitions and clamp lower boundaries using global min IDs.
 	if isCompleteHistoricalSet(checkpoints) {
+		allCompleted := true
 		initialDocs := make([]int64, len(checkpoints))
 		for i, cp := range checkpoints {
+			if !cp.Completed {
+				allCompleted = false
+			}
 			initialDocs[i] = cp.ApproximateDocsMigrated
+		}
+		if allCompleted {
+			return &BackfillResumptionPlan{
+				Mode:                 ResumptionModeDirect,
+				PartitionFilters:     []bson.D{{{Key: "_id", Value: bson.D{{Key: "$exists", Value: false}}}}},
+				PartitionInitialDocs: initialDocs,
+				AllCompleted:         true,
+			}, nil
 		}
 		globalMinIDs, err := ExtractGlobalMinSafeIDs(checkpoints)
 		if err != nil {

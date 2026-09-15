@@ -392,3 +392,46 @@ func TestParseBSONType(t *testing.T) {
 	}
 }
 
+func TestBackfillCheckpoint_SaveAndLoadCompleted(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := GetPartitionCheckpointPath(tmpDir, "db", "coll", 0, 1)
+	cp := &PartitionCheckpoint{
+		Database:                "db",
+		Collection:              "coll",
+		PartitionIndex:          0,
+		TotalSplits:             1,
+		ApproximateDocsMigrated: 100,
+		UpdatedAt:               time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC),
+		Completed:               true,
+		TypeProgress: map[BSONType]*TypeRangeBoundary{
+			BSONTypeString: {
+				BSONType:    BSONTypeString,
+				SavedLastID: "last_doc",
+			},
+		},
+	}
+
+	if !cp.IsCompleted() {
+		t.Errorf("expected cp.IsCompleted() to be true")
+	}
+
+	if err := SavePartitionCheckpoint(filePath, cp); err != nil {
+		t.Fatalf("failed to save completed checkpoint: %v", err)
+	}
+
+	loaded, err := LoadPartitionCheckpoint(filePath)
+	if err != nil {
+		t.Fatalf("failed to load completed checkpoint: %v", err)
+	}
+	if loaded == nil {
+		t.Fatalf("expected loaded checkpoint to be non-nil")
+	}
+	if !loaded.IsCompleted() {
+		t.Errorf("expected loaded.IsCompleted() to be true")
+	}
+	if diff := cmp.Diff(cp, loaded); diff != "" {
+		t.Errorf("loaded checkpoint mismatch (-want +got):\n%s", diff)
+	}
+}
+
+

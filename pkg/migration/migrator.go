@@ -730,10 +730,6 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		return 0, 0, nil
 	}
 
-	if opts.BackfillStatsManager != nil {
-		opts.BackfillStatsManager.AddTargetCount(totalCount)
-	}
-
 	// If no documents, we're done
 	if totalCount == 0 {
 		m.log.Infof("No documents to migrate for collection %s", collConfig.SourceCollection)
@@ -777,6 +773,17 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	if err != nil {
 		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
+	}
+
+	if plan.IsCompleted() {
+		docs := plan.TotalDocsMigrated()
+		m.log.Infof("[%s.%s] Sequential initial backfill already completed in previous run (~%d documents). Skipping.",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
+		return docs, 0, nil
+	}
+
+	if opts.BackfillStatsManager != nil {
+		opts.BackfillStatsManager.AddTargetCount(totalCount)
 	}
 
 	switch plan.Mode {
@@ -890,6 +897,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 	var mu sync.Mutex                 // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
 
+	// proactiveSkipEnabled is an optimization flag dynamically enabled when an entire batch fails
+	// with duplicate key errors (code 11000), typically when traversing through already-migrated documents
+	// during backfill resumption. When true, workers proactively query the target collection for existing
+	// document IDs (_id: {$in: ids}) and skip them before attempting bulk inserts, avoiding heavy retry overhead.
 	proactiveSkipEnabled := &atomic.Bool{}
 
 	// Start worker pool for parallel batch processing
@@ -1095,11 +1106,9 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			collConfig.SourceCollection, migratedCount)
 	}
 
-	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
+	// Mark backfill checkpoint as completed and retain it on disk so subsequent resumption runs know this collection finished.
+	// If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
 	tracker.MarkCompleted()
-	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
-		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
-	}
 	return successCount, failedCount, nil
 }
 
@@ -1240,6 +1249,17 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	if err != nil {
 		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
+	}
+
+	if plan.IsCompleted() {
+		docs := plan.TotalDocsMigrated()
+		m.log.Infof("[%s.%s] Parallel initial backfill already completed in previous run (~%d documents). Skipping.",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, docs)
+		return docs, 0, nil
+	}
+
+	if opts.BackfillStatsManager != nil {
+		opts.BackfillStatsManager.AddTargetCount(totalCount)
 	}
 
 	var partitions []bson.D
@@ -1458,6 +1478,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		go func(partitionIndex int, filter bson.D, checkpoint *PartitionCheckpoint) {
 			defer wg.Done()
 
+			if checkpoint.IsCompleted() {
+				m.log.Infof("[%s.%s] Partition %d/%d already completed in previous run (~%d documents). Skipping.",
+					sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex+1, len(partitions), checkpoint.ApproximateDocsMigrated)
+				return
+			}
+
 			m.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
 
 			checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, len(partitions))
@@ -1492,6 +1518,10 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				workerCount = 1 // Ensure at least 1 worker per partition
 			}
 
+			// proactiveSkipEnabled is an optimization flag dynamically enabled when an entire batch fails
+			// with duplicate key errors (code 11000), typically when traversing through already-migrated documents
+			// during backfill resumption. When true, workers proactively query the target collection for existing
+			// document IDs (_id: {$in: ids}) and skip them before attempting bulk inserts, avoiding heavy retry overhead.
 			proactiveSkipEnabled := &atomic.Bool{}
 
 			m.log.Debugf("Starting %d workers for partition %d", workerCount, partitionIndex)
@@ -1689,11 +1719,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			collConfig.SourceCollection, migratedCount)
 	}
 
-	// Always clean up backfill checkpoints when the full collection scan completes.
-	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
-		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
-	}
-
+	// Retain completed partition checkpoints on disk so subsequent resumption runs know this collection finished.
 	return successCount, failedCount, nil
 }
 
