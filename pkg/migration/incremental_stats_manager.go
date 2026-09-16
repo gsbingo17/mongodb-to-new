@@ -255,9 +255,16 @@ func (sm *IncrementalStatsManager) getQueueDepthsSnapshot() string {
 		avgBatchWriteUtil = float64(totalBatchWriteLen) / float64(totalBatchWriteCap) * 100
 	}
 
+	if ingestQueue != nil {
+		return fmt.Sprintf(
+			"Ingest: %.1f%% | Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
+			ingestUtil, avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
+		)
+	}
+
 	return fmt.Sprintf(
-		"Ingest: %.1f%% | Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
-		ingestUtil, avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
+		"Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
+		avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
 	)
 }
 
