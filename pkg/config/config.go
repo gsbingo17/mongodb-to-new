@@ -57,6 +57,9 @@ type Config struct {
 
 	// Convert long field names in nested documents (defaults to false)
 	ConvertLongFieldNamesInNestedDocs bool `json:"convertLongFieldNamesInNestedDocs"`
+
+	// Change stream full document mode: "updateLookup" (default), "whenAvailable", "required", or "default"
+	FullDocumentMode string `json:"fullDocumentMode,omitempty"`
 }
 
 // BackfillRampUpConfig represents write ramp-up configuration for initial backfill
@@ -282,7 +285,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.BackfillRampUp.Strategy = "static"
 	}
 
-	// No backward compatibility needed anymore
+	// Set default value for FullDocumentMode (defaults to "updateLookup" for backwards compatibility)
+	if config.FullDocumentMode == "" {
+		config.FullDocumentMode = "updateLookup"
+	}
 
 	return &config, nil
 }

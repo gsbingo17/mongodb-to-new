@@ -180,6 +180,7 @@ func (m *Migrator) captureResumeToken(ctx context.Context, pair config.DatabaseP
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
 	defer sourceDB.Close(ctx)
+	sourceDB.SetFullDocumentMode(m.config.FullDocumentMode)
 
 	partitions := m.config.IncrementalStreamPartitions
 	if partitions <= 0 {
@@ -281,6 +282,8 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
+	sourceDB.SetFullDocumentMode(m.config.FullDocumentMode)
+	m.log.Infof("Source MongoDB change stream FullDocument mode set to: '%s'", sourceDB.GetFullDocument())
 
 	// Get maximum connection idle timeout for target
 	maxConnIdleTimeTarget := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
