@@ -78,7 +78,7 @@ func validatePrePostImageRequirements(
 
 	case "required":
 		if len(missing) > 0 {
-			return false, fmt.Errorf("fullDocumentMode is 'required', but pre/post-images are NOT enabled on: %v. Enable with: db.runCommand({collMod: \"<coll>\", changeStreamPreAndPostImages: {enabled: true}})", missing)
+			return false, fmt.Errorf("fullDocumentMode is 'required', but pre/post-images are NOT enabled on: %v. Enable with: db.runCommand({collMod: \"%s\", changeStreamPreAndPostImages: {enabled: true}})", missing, "<coll>")
 		}
 		log.Infof("[%s] Verified pre/post-images enabled on all %d collections", dbName, len(enabled))
 
@@ -116,19 +116,45 @@ func getCollectionPrePostImageStatus(ctx context.Context, sourceDB *db.MongoDB, 
 	return status, cursor.Err()
 }
 
-// reportPostImageExpiration checks cluster-level expireAfterSeconds for pre/post-images
-func reportPostImageExpiration(ctx context.Context, sourceDB *db.MongoDB, log *logger.Logger) {
-	var res bson.M
-	if err := sourceDB.GetClient().Database("admin").RunCommand(ctx, bson.D{{Key: "getClusterParameter", Value: "changeStreamOptions"}}).Decode(&res); err != nil {
-		log.Debugf("Could not query changeStreamOptions: %v", err)
-		return
+// parsePostImageExpiration extracts the expireAfterSeconds value from getClusterParameter response.
+func parsePostImageExpiration(res bson.M) (float64, bool) {
+	var prePost bson.M
+
+	// 1. Standard MongoDB 6.0+ response: clusterParameters array
+	if params, ok := res["clusterParameters"].(primitive.A); ok {
+		for _, p := range params {
+			if paramMap, ok := p.(bson.M); ok && paramMap["_id"] == "changeStreamOptions" {
+				if pp, ok := paramMap["preAndPostImages"].(bson.M); ok {
+					prePost = pp
+					break
+				}
+			}
+		}
+	} else if paramsSlice, ok := res["clusterParameters"].([]interface{}); ok {
+		for _, p := range paramsSlice {
+			if paramMap, ok := p.(bson.M); ok && paramMap["_id"] == "changeStreamOptions" {
+				if pp, ok := paramMap["preAndPostImages"].(bson.M); ok {
+					prePost = pp
+					break
+				}
+			}
+		}
 	}
-	opts, _ := res["changeStreamOptions"].(bson.M)
-	prePost, _ := opts["preAndPostImages"].(bson.M)
+
+	// 2. Direct format fallback
+	if prePost == nil {
+		if opts, ok := res["changeStreamOptions"].(bson.M); ok {
+			prePost, _ = opts["preAndPostImages"].(bson.M)
+		}
+	}
+
+	if prePost == nil {
+		return 0, false
+	}
+
 	val := prePost["expireAfterSeconds"]
 	if val == nil || val == "off" {
-		log.Info("Post-image retention (expireAfterSeconds): not set (retained until oplog roll-off)")
-		return
+		return 0, false
 	}
 
 	var sec float64
@@ -140,13 +166,40 @@ func reportPostImageExpiration(ctx context.Context, sourceDB *db.MongoDB, log *l
 	case float64:
 		sec = v
 	}
+
 	if sec > 0 {
-		log.Infof("Post-image retention (expireAfterSeconds): %.0fs (~%.1fm)", sec, sec/60.0)
+		return sec, true
 	}
+	return 0, false
 }
 
-// reportOplogRetention queries local.oplog.rs to determine the available oplog time window
+// reportPostImageExpiration checks cluster-level expireAfterSeconds for pre/post-images
+func reportPostImageExpiration(ctx context.Context, sourceDB *db.MongoDB, log *logger.Logger) {
+	var res bson.M
+	if err := sourceDB.GetClient().Database("admin").RunCommand(ctx, bson.D{{Key: "getClusterParameter", Value: "changeStreamOptions"}}).Decode(&res); err != nil {
+		log.Debugf("Could not query changeStreamOptions: %v", err)
+		return
+	}
+
+	sec, isSet := parsePostImageExpiration(res)
+	if !isSet {
+		log.Info("Post-image retention (expireAfterSeconds): not set (retained until oplog roll-off)")
+		return
+	}
+
+	log.Infof("Post-image retention (expireAfterSeconds): %.0fs (~%.1fm)", sec, sec/60.0)
+}
+
+// reportOplogRetention queries local.oplog.rs on replica sets, or reports sharded topology on mongos
 func reportOplogRetention(ctx context.Context, sourceDB *db.MongoDB, log *logger.Logger) {
+	var helloRes bson.M
+	if err := sourceDB.GetClient().Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&helloRes); err == nil {
+		if msg, _ := helloRes["msg"].(string); msg == "isdbgrid" {
+			log.Info("Source topology: sharded cluster (mongos) - oplog retention is maintained independently per shard")
+			return
+		}
+	}
+
 	coll := sourceDB.GetClient().Database("local").Collection("oplog.rs")
 	var first, last struct {
 		Ts primitive.Timestamp `bson:"ts"`

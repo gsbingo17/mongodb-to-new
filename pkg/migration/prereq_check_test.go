@@ -6,6 +6,8 @@ import (
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestValidatePrePostImageRequirements(t *testing.T) {
@@ -97,6 +99,108 @@ func TestValidatePrePostImageRequirements(t *testing.T) {
 			}
 			if allEnabled != tc.expectAllEnabled {
 				t.Errorf("expected allEnabled=%v, got %v", tc.expectAllEnabled, allEnabled)
+			}
+		})
+	}
+}
+
+func TestParsePostImageExpiration(t *testing.T) {
+	testCases := []struct {
+		name        string
+		res         bson.M
+		expectSec   float64
+		expectIsSet bool
+	}{
+		{
+			name: "StandardClusterParametersPrimitiveA",
+			res: bson.M{
+				"clusterParameters": primitive.A{
+					bson.M{
+						"_id": "changeStreamOptions",
+						"preAndPostImages": bson.M{
+							"expireAfterSeconds": int32(1800),
+						},
+					},
+				},
+				"ok": 1,
+			},
+			expectSec:   1800,
+			expectIsSet: true,
+		},
+		{
+			name: "StandardClusterParametersSliceInterface",
+			res: bson.M{
+				"clusterParameters": []interface{}{
+					bson.M{
+						"_id": "changeStreamOptions",
+						"preAndPostImages": bson.M{
+							"expireAfterSeconds": float64(3600),
+						},
+					},
+				},
+				"ok": 1,
+			},
+			expectSec:   3600,
+			expectIsSet: true,
+		},
+		{
+			name: "FallbackDirectChangeStreamOptionsMap",
+			res: bson.M{
+				"changeStreamOptions": bson.M{
+					"preAndPostImages": bson.M{
+						"expireAfterSeconds": int64(900),
+					},
+				},
+				"ok": 1,
+			},
+			expectSec:   900,
+			expectIsSet: true,
+		},
+		{
+			name: "ExpireAfterSecondsOff",
+			res: bson.M{
+				"clusterParameters": primitive.A{
+					bson.M{
+						"_id": "changeStreamOptions",
+						"preAndPostImages": bson.M{
+							"expireAfterSeconds": "off",
+						},
+					},
+				},
+				"ok": 1,
+			},
+			expectSec:   0,
+			expectIsSet: false,
+		},
+		{
+			name: "NoPreAndPostImages",
+			res: bson.M{
+				"clusterParameters": primitive.A{
+					bson.M{
+						"_id": "otherParameter",
+					},
+				},
+				"ok": 1,
+			},
+			expectSec:   0,
+			expectIsSet: false,
+		},
+		{
+			name:        "EmptyResponse",
+			res:         bson.M{},
+			expectSec:   0,
+			expectIsSet: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec, isSet := parsePostImageExpiration(tc.res)
+			if isSet != tc.expectIsSet {
+				t.Fatalf("expected isSet=%v, got %v", tc.expectIsSet, isSet)
+			}
+			if sec != tc.expectSec {
+				t.Fatalf("expected sec=%v, got %v", tc.expectSec, sec)
 			}
 		})
 	}
