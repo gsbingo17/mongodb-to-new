@@ -182,6 +182,11 @@ func (m *Migrator) captureResumeToken(ctx context.Context, pair config.DatabaseP
 	defer sourceDB.Close(ctx)
 	sourceDB.SetFullDocumentMode(m.config.FullDocumentMode)
 
+	// Pre-flight check on source change stream prerequisites
+	if err := CheckSourceChangeStreamPrerequisites(ctx, sourceDB, pair.Source.Database, pair.Target.Collections, m.config.FullDocumentMode, m.log); err != nil {
+		return fmt.Errorf("source change stream pre-flight check failed: %w", err)
+	}
+
 	partitions := m.config.IncrementalStreamPartitions
 	if partitions <= 0 {
 		partitions = 1
@@ -299,6 +304,13 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	collections, err := m.getCollectionsToProcess(ctx, sourceDB, pair.Target.Collections)
 	if err != nil {
 		return fmt.Errorf("failed to determine collections to process: %w", err)
+	}
+
+	// Validate source change stream prerequisites (fail-fast on missing post-images, report retention)
+	if err := CheckSourceChangeStreamPrerequisites(ctx, sourceDB, pair.Source.Database, collections, m.config.FullDocumentMode, m.log); err != nil {
+		sourceDB.Close(ctx)
+		targetDB.Close(ctx)
+		return fmt.Errorf("source change stream pre-flight check failed for database %s: %w", pair.Source.Database, err)
 	}
 
 	// Apply database target-level default UpsertMode if active
