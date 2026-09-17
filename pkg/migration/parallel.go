@@ -477,8 +477,8 @@ type Worker struct {
 	// Queue of raw change events waiting to be partitioned and batched concurrently
 	batchingQueue chan interface{}
 
-	// Current group being built
-	currentGroup *OperationGroup
+	// Current groups being built, partitioned per collection namespace
+	currentGroups map[string]*OperationGroup
 
 	// Queue of groups waiting to be processed
 	batchWriteQueue chan *OperationGroup
@@ -506,7 +506,7 @@ type Worker struct {
 
 	// Dynamic grouping configurations
 	groupOpsByDistinctId bool
-	currentGroupIDs      map[int]bool
+	currentGroupIDs      map[string]map[int]bool
 	flushInterval        time.Duration
 	partitionTracker     *PartitionTracker
 	transformer          *FieldTransformer
@@ -541,20 +541,38 @@ func (w *Worker) pushToBatchWriteQueue(group *OperationGroup) {
 	}
 }
 
-// flushCurrentGroup moves the current group to the batch write queue if it exists
-func (w *Worker) flushCurrentGroup() bool {
-	// Must be called with lock held
-	if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
-		w.log.Debugf("Flushing group: %s.%s with %d operations",
-			w.currentGroup.Namespace, w.currentGroup.OpType,
-			len(w.currentGroup.Operations))
-
-		w.pushToBatchWriteQueue(w.currentGroup)
-		w.currentGroup = nil
-		w.currentGroupIDs = make(map[int]bool)
-		return true
+// flushGroupLocked sends a specific collection's group to the batch write queue and cleans up its tracking map.
+// Must be called with w.mu held.
+func (w *Worker) flushGroupLocked(namespace string) bool {
+	group, exists := w.currentGroups[namespace]
+	if !exists || group == nil || len(group.Operations) == 0 {
+		return false
 	}
-	return false
+	w.log.Debugf("Flushing group: %s.%s with %d operations",
+		group.Namespace, group.OpType, len(group.Operations))
+
+	w.pushToBatchWriteQueue(group)
+	delete(w.currentGroups, namespace)
+	delete(w.currentGroupIDs, namespace)
+	return true
+}
+
+// flushAllGroupsLocked flushes all open collection groups across this worker.
+// Must be called with w.mu held.
+func (w *Worker) flushAllGroupsLocked() bool {
+	flushedAny := false
+	for ns := range w.currentGroups {
+		if w.flushGroupLocked(ns) {
+			flushedAny = true
+		}
+	}
+	return flushedAny
+}
+
+// flushCurrentGroup flushes all active groups across all collections for this worker.
+// Must be called with w.mu held. Retained for interface and test compatibility.
+func (w *Worker) flushCurrentGroup() bool {
+	return w.flushAllGroupsLocked()
 }
 
 type statsTrackingDLQ struct {
@@ -612,7 +630,8 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		retryManager:              retryManager,
 		incrementalStatsManager:              incrementalStatsManager,
 		groupOpsByDistinctId:      groupOpsByDistinctId,
-		currentGroupIDs:           make(map[int]bool),
+		currentGroups:             make(map[string]*OperationGroup),
+		currentGroupIDs:           make(map[string]map[int]bool),
 		flushInterval:             flushInterval,
 		transformer:               transformer,
 	}
@@ -650,12 +669,15 @@ func (w *Worker) eventLoop() {
 
 		case <-ticker.C:
 			w.mu.Lock()
-			if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
-				if time.Since(w.currentGroup.CreatedAt) >= w.flushInterval {
-					if w.incrementalStatsManager != nil {
-						w.incrementalStatsManager.IncrementTimeoutFlushes()
+			now := time.Now()
+			for ns, grp := range w.currentGroups {
+				if grp != nil && len(grp.Operations) > 0 {
+					if now.Sub(grp.CreatedAt) >= w.flushInterval {
+						if w.incrementalStatsManager != nil {
+							w.incrementalStatsManager.IncrementTimeoutFlushes()
+						}
+						w.flushGroupLocked(ns)
 					}
-					w.flushCurrentGroup()
 				}
 			}
 			w.mu.Unlock()
@@ -801,67 +823,68 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	docHash := hashDocumentID(docID)
 
-	// Check if we need to create a new group
+	group := w.currentGroups[namespace]
+	groupIDs := w.currentGroupIDs[namespace]
+
+	// Check if we need to create a new group for this collection
 	var needNewGroup bool
 	if w.groupOpsByDistinctId {
-		needNewGroup = w.currentGroup == nil ||
-			w.currentGroup.Namespace != namespace ||
-			len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize ||
-			w.currentGroupIDs[docHash]
+		needNewGroup = group == nil ||
+			len(group.Operations) >= w.incrementalWriteBatchSize ||
+			(groupIDs != nil && groupIDs[docHash])
 	} else {
-		needNewGroup = w.currentGroup == nil ||
-			w.currentGroup.OpType != opType ||
-			w.currentGroup.Namespace != namespace ||
-			len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize
+		needNewGroup = group == nil ||
+			group.OpType != opType ||
+			len(group.Operations) >= w.incrementalWriteBatchSize
 	}
 
-	if needNewGroup && w.currentGroup != nil {
+	if needNewGroup && group != nil {
 		if w.incrementalStatsManager != nil {
 			// Determine the reason the group had to be flushed
-			if w.groupOpsByDistinctId && w.currentGroupIDs[docHash] {
+			if w.groupOpsByDistinctId && groupIDs != nil && groupIDs[docHash] {
 				w.incrementalStatsManager.IncrementGroupFlushReason("collision")
-			} else if w.currentGroup.Namespace != namespace {
-				w.incrementalStatsManager.IncrementGroupFlushReason("namespace")
-			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
+			} else if len(group.Operations) >= w.incrementalWriteBatchSize {
 				w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
-			} else if w.currentGroup.OpType != opType {
+			} else if group.OpType != opType {
 				w.incrementalStatsManager.IncrementGroupFlushReason("optype")
 			}
 		}
 
-		// Add current group to processing queue
-		w.pushToBatchWriteQueue(w.currentGroup)
-		w.currentGroup = nil
-		w.currentGroupIDs = make(map[int]bool)
+		w.flushGroupLocked(namespace)
+		group = nil
+		groupIDs = nil
 	}
 
-	// Create a new group if needed
-	if w.currentGroup == nil {
+	// Create a new group for this collection if needed
+	if group == nil {
 		groupOpType := opType
 		if w.groupOpsByDistinctId {
 			groupOpType = "mixed"
 		}
-		w.currentGroup = &OperationGroup{
+		group = &OperationGroup{
 			Namespace:  namespace,
 			OpType:     groupOpType,
 			Operations: []WriteOperation{op},
 			CreatedAt:  time.Now(), // Set creation timestamp
 		}
-		w.currentGroupIDs = make(map[int]bool)
-		w.currentGroupIDs[docHash] = true
+		w.currentGroups[namespace] = group
+		w.currentGroupIDs[namespace] = map[int]bool{docHash: true}
 	} else {
 		// Add to current group
-		w.currentGroup.Operations = append(w.currentGroup.Operations, op)
-		w.currentGroupIDs[docHash] = true
+		group.Operations = append(group.Operations, op)
+		if groupIDs == nil {
+			groupIDs = make(map[int]bool)
+			w.currentGroupIDs[namespace] = groupIDs
+		}
+		groupIDs[docHash] = true
 	}
 
 	// If current group has reached max size, add it to the queue
-	if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
+	if len(group.Operations) >= w.incrementalWriteBatchSize {
 		if w.incrementalStatsManager != nil {
 			w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
 		}
-		w.pushToBatchWriteQueue(w.currentGroup)
-		w.currentGroup = nil
+		w.flushGroupLocked(namespace)
 	}
 }
 
@@ -1510,12 +1533,15 @@ func StartPeriodicFlushLoop(ctx context.Context, workers []*Worker, flushInterva
 						continue
 					}
 					worker.mu.Lock()
-					if worker.currentGroup != nil && len(worker.currentGroup.Operations) > 0 {
-						if time.Since(worker.currentGroup.CreatedAt) >= flushInterval {
-							log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
-								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
-								len(worker.currentGroup.Operations))
-							worker.flushCurrentGroup()
+					now := time.Now()
+					for ns, grp := range worker.currentGroups {
+						if grp != nil && len(grp.Operations) > 0 {
+							if now.Sub(grp.CreatedAt) >= flushInterval {
+								log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
+									worker.id, grp.Namespace, grp.OpType,
+									len(grp.Operations))
+								worker.flushGroupLocked(ns)
+							}
 						}
 					}
 					worker.mu.Unlock()
