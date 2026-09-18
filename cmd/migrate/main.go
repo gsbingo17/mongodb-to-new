@@ -25,6 +25,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	fullDocumentMode := flag.String("full-document-mode", "", "Change stream full document mode: 'updateLookup' (default), 'whenAvailable', 'required', or 'default'")
 	dryRun := flag.Bool("dry-run", false, "Dry run mode (skips writes, outputs partitioning recommendations on backfill)")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
@@ -58,6 +59,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// Override full-document-mode if specified on CLI
+	if *fullDocumentMode != "" {
+		log.Infof("Overriding fullDocumentMode via command-line flag: '%s'", *fullDocumentMode)
+		cfg.FullDocumentMode = *fullDocumentMode
+	}
+
 	// Display and log the loaded configuration with sensitive values masked
 	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
 
@@ -171,6 +179,13 @@ func displayUsage() {
 	fmt.Println("        Debian command-line examples to get 'now':")
 	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
 	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
+	fmt.Println("  -full-document-mode string")
+	fmt.Println("        Change stream full document mode: 'updateLookup' (default), 'whenAvailable', 'required', or 'default'")
+	fmt.Println("        - updateLookup: MongoDB driver fetches the entire document for update events via an additional lookup.")
+	fmt.Println("        - whenAvailable: MongoDB includes post-images directly in the change stream event if collection has")
+	fmt.Println("          changeStreamPreAndPostImages enabled; avoids point lookups and improves throughput significantly.")
+	fmt.Println("        - required: Similar to whenAvailable, but MongoDB server raises an error if post-images are unavailable.")
+	fmt.Println("        - default: Standard change stream behavior (no post-images for updates).")
 	fmt.Println("  -dry-run")
 	fmt.Println("        Dry run mode (skips writes).")
 	fmt.Println("        - In backfill modes ('migrate' or 'live' initial phase): connects to the source")

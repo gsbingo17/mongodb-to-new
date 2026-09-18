@@ -346,3 +346,32 @@ func TestLoadConfigIDTypeForPartition(t *testing.T) {
 		t.Error("Expected LoadConfig to fail validation for invalid idTypeForPartition, but it succeeded")
 	}
 }
+
+func TestLoadConfigFullDocumentMode(t *testing.T) {
+	tests := []struct {
+		json         string
+		expectedMode string
+	}{
+		{`{"databasePairs":[{"source":{"connectionString":"mongodb://h","database":"d"},"target":{"connectionString":"mongodb://h","database":"d"}}]}`, "updateLookup"},
+		{`{"fullDocumentMode":"whenAvailable","databasePairs":[{"source":{"connectionString":"mongodb://h","database":"d"},"target":{"connectionString":"mongodb://h","database":"d"}}]}`, "whenAvailable"},
+	}
+
+	for _, tt := range tests {
+		tmp, err := os.CreateTemp("", "cfg_*.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(tmp.Name())
+		_, _ = tmp.WriteString(tt.json)
+		_ = tmp.Close()
+
+		cfg, err := LoadConfig(tmp.Name())
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.FullDocumentMode != tt.expectedMode {
+			t.Errorf("got FullDocumentMode %q, expected %q", cfg.FullDocumentMode, tt.expectedMode)
+		}
+	}
+}
+

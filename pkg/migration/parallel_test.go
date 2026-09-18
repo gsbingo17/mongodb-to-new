@@ -59,9 +59,11 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 	// Since we corrected the logic bug to always skip update events with a nil fullDocument payload (regardless
 	// of whether a incrementalStatsManager is set), we verify that currentGroup remains nil (event is gracefully skipped).
 	// This prevents target database engines from encountering raw parser issues and writing garbage entries to DLQ.
-	if worker.currentGroup != nil {
-		t.Fatalf("expected event to be skipped (currentGroup == nil), but got currentGroup with %d operations", len(worker.currentGroup.Operations))
+	worker.mu.Lock()
+	if len(worker.currentGroups) != 0 {
+		t.Fatalf("expected event to be skipped (currentGroups empty), but got %d active groups", len(worker.currentGroups))
 	}
+	worker.mu.Unlock()
 }
 
 func TestWorkerProcessEventUpdateWithNullFullDocumentAndIncrementalStatsManager(t *testing.T) {
@@ -105,9 +107,11 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndIncrementalStatsManager(
 	worker.ProcessEvent(event)
 
 	// Verify that the event was skipped (currentGroup is nil)
-	if worker.currentGroup != nil {
-		t.Fatalf("expected event to be skipped (currentGroup == nil), but got currentGroup with %d operations", len(worker.currentGroup.Operations))
+	worker.mu.Lock()
+	if len(worker.currentGroups) != 0 {
+		t.Fatalf("expected event to be skipped (currentGroups empty), but got %d active groups", len(worker.currentGroups))
 	}
+	worker.mu.Unlock()
 
 	// Verify that "update-doc-missing" metric was incremented
 	statsMgr.mu.Lock()
@@ -301,14 +305,14 @@ func TestWorkerFlushCurrentGroupResetsIDs(t *testing.T) {
 
 	worker.mu.Lock()
 	docHash1 := hashDocumentID("doc_abc")
-	if !worker.currentGroupIDs[docHash1] {
+	if worker.currentGroupIDs["testdb.testcoll"] == nil || !worker.currentGroupIDs["testdb.testcoll"][docHash1] {
 		t.Errorf("expected doc_abc hash to be registered in currentGroupIDs")
 	}
 
 	// Flush current group manually (like a timeout flush)
 	worker.flushCurrentGroup()
-	if worker.currentGroup != nil {
-		t.Errorf("expected currentGroup to be nil after flush")
+	if len(worker.currentGroups) != 0 {
+		t.Errorf("expected currentGroups to be empty after flush")
 	}
 	if len(worker.currentGroupIDs) != 0 {
 		t.Errorf("expected currentGroupIDs to be reset/empty after flush, got %d elements", len(worker.currentGroupIDs))
@@ -459,10 +463,10 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 
 	// Verify group is active
 	worker.mu.Lock()
-	isActive := worker.currentGroup != nil
+	isActive := len(worker.currentGroups) > 0
 	worker.mu.Unlock()
 	if !isActive {
-		t.Fatal("expected currentGroup to be active")
+		t.Fatal("expected currentGroups to have an active group")
 	}
 
 	// Wait for the background eventLoop ticker to fire (e.g. 150ms is plenty of time for a 100ms ticker)
@@ -470,10 +474,10 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 
 	// Verify group has been timeout-flushed to the write queue automatically!
 	worker.mu.Lock()
-	isNil := worker.currentGroup == nil
+	isNil := len(worker.currentGroups) == 0
 	worker.mu.Unlock()
 	if !isNil {
-		t.Errorf("expected currentGroup to be nil/flushed by background timeout ticker")
+		t.Errorf("expected currentGroups to be empty/flushed by background timeout ticker")
 	}
 
 	// Give background consumer thread a moment to drain and process the group
@@ -525,10 +529,10 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 
 	// Verify group has been successfully flushed upon cancellation!
 	worker.mu.Lock()
-	isNil := worker.currentGroup == nil
+	isNil := len(worker.currentGroups) == 0
 	worker.mu.Unlock()
 	if !isNil {
-		t.Errorf("expected currentGroup to be nil/flushed upon context cancellation")
+		t.Errorf("expected currentGroups to be empty/flushed upon context cancellation")
 	}
 
 	// Give background consumer thread a moment to drain and process the group
@@ -676,6 +680,171 @@ func TestIsDuplicateKeyError(t *testing.T) {
 		if res != tc.expected {
 			t.Errorf("isDuplicateKeyError(%d, %q) = %v; want %v", tc.code, tc.msg, res, tc.expected)
 		}
+	}
+}
+
+func TestWorkerMultiCollectionInterleaving(t *testing.T) {
+	log := logger.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	statsMgr := NewIncrementalStatsManager(log, 0, false)
+	batchSize := 4
+
+	worker := NewWorker(
+		1,
+		ctx,
+		log,
+		nil,
+		nil,
+		batchSize,
+		false,
+		nil,
+		nil,
+		statsMgr,
+		true, // groupOpsByDistinctId
+		5*time.Minute,
+		8192,
+		16,
+		NewFieldTransformer(false, false, false, log),
+	)
+
+	// Interleave 3 events for colA and 3 events for colB (alternating).
+	// Neither collection reaches batchSize (4), so both should buffer concurrently without namespace flushes.
+	for i := 0; i < 3; i++ {
+		worker.ProcessEvent(bson.M{
+			"operationType": "insert",
+			"ns":            bson.M{"db": "testdb", "coll": "colA"},
+			"documentKey":   bson.M{"_id": fmt.Sprintf("doc_A_%d", i)},
+			"fullDocument":  bson.M{"val": i},
+		})
+		worker.ProcessEvent(bson.M{
+			"operationType": "insert",
+			"ns":            bson.M{"db": "testdb", "coll": "colB"},
+			"documentKey":   bson.M{"_id": fmt.Sprintf("doc_B_%d", i)},
+			"fullDocument":  bson.M{"val": i},
+		})
+	}
+
+	worker.mu.Lock()
+	// Both collections should have active groups with 3 operations each
+	grpA := worker.currentGroups["testdb.colA"]
+	grpB := worker.currentGroups["testdb.colB"]
+	if grpA == nil || len(grpA.Operations) != 3 {
+		t.Fatalf("expected colA to have 3 buffered operations, got %v", grpA)
+	}
+	if grpB == nil || len(grpB.Operations) != 3 {
+		t.Fatalf("expected colB to have 3 buffered operations, got %v", grpB)
+	}
+	worker.mu.Unlock()
+
+	// Verify that namespace flush reason count is exactly 0
+	if nsFlushes := statsMgr.GetGroupFlushReasonCount("namespace"); nsFlushes != 0 {
+		t.Errorf("expected 0 namespace flushes, got %d", nsFlushes)
+	}
+
+	// Now send 1 more event to colA to hit batchSize (4).
+	// Only colA should be flushed to the queue, while colB remains buffered!
+	worker.ProcessEvent(bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "colA"},
+		"documentKey":   bson.M{"_id": "doc_A_3"},
+		"fullDocument":  bson.M{"val": 3},
+	})
+
+	worker.mu.Lock()
+	if worker.currentGroups["testdb.colA"] != nil {
+		t.Errorf("expected colA to be flushed after hitting batchSize, but still active")
+	}
+	if worker.currentGroups["testdb.colB"] == nil || len(worker.currentGroups["testdb.colB"].Operations) != 3 {
+		t.Errorf("expected colB to remain buffered with 3 operations, got %v", worker.currentGroups["testdb.colB"])
+	}
+	worker.mu.Unlock()
+
+	// Verify colA was flushed due to "batchfull"
+	if batchFullFlushes := statsMgr.GetGroupFlushReasonCount("batchfull"); batchFullFlushes != 1 {
+		t.Errorf("expected 1 batchfull flush, got %d", batchFullFlushes)
+	}
+}
+
+func TestWorkerCollisionIsolationAcrossCollections(t *testing.T) {
+	log := logger.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	statsMgr := NewIncrementalStatsManager(log, 0, false)
+	batchSize := 10
+
+	worker := NewWorker(
+		1,
+		ctx,
+		log,
+		nil,
+		nil,
+		batchSize,
+		false,
+		nil,
+		nil,
+		statsMgr,
+		true, // groupOpsByDistinctId
+		5*time.Minute,
+		8192,
+		16,
+		NewFieldTransformer(false, false, false, log),
+	)
+
+	// Send an operation to colA and colB with the same document ID "shared_id"
+	worker.ProcessEvent(bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "colA"},
+		"documentKey":   bson.M{"_id": "shared_id"},
+		"fullDocument":  bson.M{"data": "colA_1"},
+	})
+	worker.ProcessEvent(bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "colB"},
+		"documentKey":   bson.M{"_id": "shared_id"},
+		"fullDocument":  bson.M{"data": "colB_1"},
+	})
+
+	// Both should buffer without collision because they belong to different collections
+	worker.mu.Lock()
+	if worker.currentGroups["testdb.colA"] == nil || len(worker.currentGroups["testdb.colA"].Operations) != 1 {
+		t.Fatalf("expected colA to have 1 op")
+	}
+	if worker.currentGroups["testdb.colB"] == nil || len(worker.currentGroups["testdb.colB"].Operations) != 1 {
+		t.Fatalf("expected colB to have 1 op")
+	}
+	worker.mu.Unlock()
+
+	if collisions := statsMgr.GetGroupFlushReasonCount("collision"); collisions != 0 {
+		t.Errorf("expected 0 collisions across different collections, got %d", collisions)
+	}
+
+	// Now send a duplicate event to colA with the same ID "shared_id".
+	// This SHOULD trigger collision flush for colA only!
+	worker.ProcessEvent(bson.M{
+		"operationType": "update",
+		"ns":            bson.M{"db": "testdb", "coll": "colA"},
+		"documentKey":   bson.M{"_id": "shared_id"},
+		"fullDocument":  bson.M{"data": "colA_2"},
+	})
+
+	worker.mu.Lock()
+	// colA was flushed on collision and a new group was created with the second op
+	grpA := worker.currentGroups["testdb.colA"]
+	if grpA == nil || len(grpA.Operations) != 1 {
+		t.Errorf("expected colA to have new group with 1 op after collision flush, got %v", grpA)
+	}
+	// colB should still have its original buffered operation
+	grpB := worker.currentGroups["testdb.colB"]
+	if grpB == nil || len(grpB.Operations) != 1 {
+		t.Errorf("expected colB to remain untouched with 1 op, got %v", grpB)
+	}
+	worker.mu.Unlock()
+
+	if collisions := statsMgr.GetGroupFlushReasonCount("collision"); collisions != 1 {
+		t.Errorf("expected 1 collision flush, got %d", collisions)
 	}
 }
 
