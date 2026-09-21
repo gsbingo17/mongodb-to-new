@@ -6,10 +6,12 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -678,4 +680,107 @@ func TestIsDuplicateKeyError(t *testing.T) {
 		}
 	}
 }
+
+// TestDistributorGetShardKeyFieldsForRawEvent verifies that EventDistributor extracts the configured
+// shard key fields for an event's collection namespace, defaulting to ["_id"].
+func TestDistributorGetShardKeyFieldsForRawEvent(t *testing.T) {
+	d := &EventDistributor{
+		collectionConfigs: map[string]map[string]config.CollectionConfig{
+			"testdb": {
+				"orders": config.CollectionConfig{
+					SourceCollection: "orders",
+					ShardKey:         "order_id",
+				},
+				"compound": config.CollectionConfig{
+					SourceCollection: "compound",
+					ShardKey:         "customer_id,order_id",
+				},
+				"users": config.CollectionConfig{
+					SourceCollection: "users",
+					ShardKey:         "",
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		db       string
+		coll     string
+		expected []string
+	}{
+		{
+			name:     "custom single shard key",
+			db:       "testdb",
+			coll:     "orders",
+			expected: []string{"order_id"},
+		},
+		{
+			name:     "custom compound shard key",
+			db:       "testdb",
+			coll:     "compound",
+			expected: []string{"customer_id", "order_id"},
+		},
+		{
+			name:     "unconfigured or empty defaults to _id",
+			db:       "testdb",
+			coll:     "users",
+			expected: []string{"_id"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rawBytes, err := bson.Marshal(bson.M{
+				"ns": bson.M{"db": tc.db, "coll": tc.coll},
+			})
+			if err != nil {
+				t.Fatalf("failed to marshal BSON: %v", err)
+			}
+			actual := d.getShardKeyFieldsForRawEvent(bson.Raw(rawBytes))
+			if !reflect.DeepEqual(actual, tc.expected) {
+				t.Errorf("getShardKeyFieldsForRawEvent() = %v, want %v", actual, tc.expected)
+			}
+		})
+	}
+}
+
+// TestDistributorCustomShardKeyDeterministicRouting verifies that events with the same custom shard key
+// hash to the same worker index regardless of different document _ids.
+func TestDistributorCustomShardKeyDeterministicRouting(t *testing.T) {
+	d := &EventDistributor{
+		incrementalWorkerCount: 8,
+		collectionConfigs: map[string]map[string]config.CollectionConfig{
+			"testdb": {
+				"orders": config.CollectionConfig{
+					SourceCollection: "orders",
+					ShardKey:         "order_id",
+				},
+			},
+		},
+	}
+
+	// Two events with the SAME order_id but DIFFERENT _id values
+	event1 := bson.M{
+		"operationType": "insert",
+		"ns":            bson.M{"db": "testdb", "coll": "orders"},
+		"documentKey":   bson.M{"order_id": "ORD-999", "_id": "id-aaa"},
+	}
+	event2 := bson.M{
+		"operationType": "update",
+		"ns":            bson.M{"db": "testdb", "coll": "orders"},
+		"documentKey":   bson.M{"order_id": "ORD-999", "_id": "id-bbb"},
+	}
+
+	raw1, _ := bson.Marshal(event1)
+	raw2, _ := bson.Marshal(event2)
+
+	w1 := d.getWorkerIndexForRaw(bson.Raw(raw1))
+	w2 := d.getWorkerIndexForRaw(bson.Raw(raw2))
+
+	if w1 != w2 {
+		t.Fatalf("Expected same worker for same order_id: worker1=%d, worker2=%d", w1, w2)
+	}
+}
+
 

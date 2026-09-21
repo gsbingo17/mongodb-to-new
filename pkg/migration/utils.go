@@ -80,18 +80,69 @@ func BuildPartitionPipeline(streamIndex, totalStreams int, sourceDB string, coll
 
 	// 2. ID Partitioning stage (FNV-1a 32-bit hash)
 	if totalStreams > 1 {
-		pipeline = append(pipeline, buildPartitionHashStage(streamIndex, totalStreams))
+		pipeline = append(pipeline, buildPartitionHashStage(streamIndex, totalStreams, collections))
 	}
 
 	return pipeline
 }
 
+// buildKeyExprForFields builds the expression that stringifies a field or concatenates compound fields.
+func buildKeyExprForFields(fields []string) bson.D {
+	if len(fields) == 0 || (len(fields) == 1 && fields[0] == "_id") {
+		return bson.D{{Key: "$toString", Value: "$documentKey._id"}}
+	}
+	if len(fields) == 1 {
+		return bson.D{{Key: "$toString", Value: "$documentKey." + fields[0]}}
+	}
+	// Compound shard key: concatenate stringified fields with "_"
+	var concatArgs bson.A
+	for i, f := range fields {
+		if i > 0 {
+			concatArgs = append(concatArgs, "_")
+		}
+		concatArgs = append(concatArgs, bson.D{{Key: "$toString", Value: "$documentKey." + f}})
+	}
+	return bson.D{{Key: "$concat", Value: concatArgs}}
+}
+
+// buildTargetKeyExpr builds the aggregation expression that produces the string to hash for partitioning.
+// If all collections use the default "_id" (or if collections is empty), it returns {"$toString": "$documentKey._id"}.
+// For collections with custom or compound shard keys, it builds a dynamic $switch over "$ns.coll".
+func buildTargetKeyExpr(collections []config.CollectionConfig) bson.D {
+	var branches bson.A
+	for _, c := range collections {
+		fields := c.GetShardKeyFields()
+		if len(fields) == 1 && fields[0] == "_id" {
+			continue // Handled by $switch default
+		}
+		branches = append(branches, bson.D{
+			{Key: "case", Value: bson.D{{Key: "$eq", Value: bson.A{"$ns.coll", c.SourceCollection}}}},
+			{Key: "then", Value: buildKeyExprForFields(fields)},
+		})
+	}
+
+	if len(branches) == 0 {
+		return bson.D{{Key: "$toString", Value: "$documentKey._id"}}
+	}
+	if len(branches) == 1 && len(collections) == 1 {
+		return buildKeyExprForFields(collections[0].GetShardKeyFields())
+	}
+	return bson.D{
+		{Key: "$switch", Value: bson.D{
+			{Key: "branches", Value: branches},
+			{Key: "default", Value: bson.D{{Key: "$toString", Value: "$documentKey._id"}}},
+		}},
+	}
+}
+
 // buildPartitionHashStage builds the zero-JavaScript, loopless FNV-1a 32-bit hash match stage
-func buildPartitionHashStage(streamIndex, totalStreams int) bson.D {
+func buildPartitionHashStage(streamIndex, totalStreams int, collections []config.CollectionConfig) bson.D {
 	const asciiString = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-	// Get length of the BSON stringified ID
-	strLen := bson.D{bson.E{Key: "$strLenCP", Value: bson.D{bson.E{Key: "$toString", Value: "$documentKey._id"}}}}
+	targetKeyExpr := buildTargetKeyExpr(collections)
+
+	// Get length of the target stringified key
+	strLen := bson.D{bson.E{Key: "$strLenCP", Value: targetKeyExpr}}
 
 	// Safe starting position for trailing 2 characters: Max(0, length - 2)
 	startPos := bson.D{
@@ -111,10 +162,10 @@ func buildPartitionHashStage(streamIndex, totalStreams int) bson.D {
 		}},
 	}
 
-	// Extract the trailing 2 BSON stringified ID characters safely
+	// Extract the trailing 2 target stringified key characters safely
 	last2Sub := bson.D{
 		bson.E{Key: "$substrCP", Value: bson.A{
-			bson.D{bson.E{Key: "$toString", Value: "$documentKey._id"}},
+			targetKeyExpr,
 			startPos,
 			subLen,
 		}},
