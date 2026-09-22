@@ -364,6 +364,28 @@ func TestDiscoverPresentBSONTypeCounts_NilCollection(t *testing.T) {
 	}
 }
 
+func TestCandidateBSONTypes_CanonicalOrder(t *testing.T) {
+	expectedOrder := []BSONType{
+		BSONTypeNumber,
+		BSONTypeString,
+		BSONTypeBinary,
+		BSONTypeObjectID,
+		BSONTypeBool,
+		BSONTypeDate,
+		BSONTypeTimestamp,
+	}
+
+	if len(CandidateBSONTypes) != len(expectedOrder) {
+		t.Fatalf("expected %d candidate BSON types, got %d", len(expectedOrder), len(CandidateBSONTypes))
+	}
+
+	for i, expected := range expectedOrder {
+		if CandidateBSONTypes[i] != expected {
+			t.Errorf("CandidateBSONTypes[%d] = %q, want %q", i, CandidateBSONTypes[i], expected)
+		}
+	}
+}
+
 func TestParseBSONType(t *testing.T) {
 	tests := []struct {
 		input    string
