@@ -7,6 +7,18 @@ This Go application replicates data from one MongoDB database to another MongoDB
     - **Initial Migration:** A one-time migration of existing data from the source MongoDB to the target MongoDB.
     - **Incremental Replication:** Uses MongoDB change streams to continuously synchronize data between the two databases, replicating any new changes made after the initial migration.
 
+## Production Migration Runbook & User Guide
+
+For an end-to-end operational guide covering:
+- **GCE VM Specifications & High-Performance Networking** (`n2-highmem-64`, SSD, `TIER_1` egress)
+- **Pre-Flight Performance Benchmarking** (dry-run read rates, historical oplog replay, oplog window sizing)
+- **Production Configuration Template** (`mongodb_replication_config.json`)
+- **Live Migration Execution** (unified `--mode=live` vs. decoupled, DLQ reprocessing, final cutover)
+- **Interruption Recovery & Dynamic Partition Scaling**
+- **Log Metrics & Statistics Interpretation**
+
+Please refer to the **[Production User Guide & Runbook (USER_GUIDE.md)](USER_GUIDE.md)**.
+
 ## Prerequisites
 
 ### General Requirements
