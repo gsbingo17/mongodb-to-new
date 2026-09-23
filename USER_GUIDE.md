@@ -190,7 +190,7 @@ If backfill completes with failures, it enters `CompletedWithFailures` and halts
 Once `failedCount == 0`, state updates to `Completed`. Restart `--mode=live` to proceed to live replication.
 
 ### Final Cutover & Verification
-1. Monitor live replication stats until lag is near-zero (`< 1s`).
+1. Monitor live replication stats until lag is near-zero.
 2. **Pause write traffic on the source database.**
 3. Allow live replicator to drain remaining changes until replication lag reaches `0`, then stop (`Ctrl+C`).
 4. Reprocess any final DLQ records:
@@ -209,8 +209,8 @@ Once `failedCount == 0`, state updates to `Completed`. Restart `--mode=live` to 
 
 ### Scenario A: Interrupted during Backfill
 - **Automated DLQ Backup**: Restarting `--mode=live` automatically backs up the active DLQ to `dlq.json.backup-<timestamp>`.
-- **Option 1 (Resume from Checkpoints - Recommended)**: Restart `./migrate --config=mongodb_replication_config.json --mode=live`. Resumes from the last saved checkpoint per partition.
-- **Option 2 (Fresh Restart)**: Delete `backfillCheckpoint-*.json` before restarting `--mode=live` to re-scan from scratch.
+- **Option 1: Resume from Checkpoints**: Restart `./migrate --config=mongodb_replication_config.json --mode=live`. Resumes from the last saved checkpoint per partition.
+- **Option 2: Fresh Restart from Scratch**: Delete `backfillCheckpoint-*.json` before restarting `--mode=live` to re-scan from scratch.
 
 ### Scenario B: Interrupted during Replication
 - **Automatic Resume**: Since backfill is marked `Completed`, restarting `--mode=live` skips backfill and resumes streaming from the last watermark.
@@ -266,6 +266,6 @@ Change stream statistics (last 30s):
   - Group Flushes:  [batchfull: 8 (0.27/sec), timeout: 0 (0.00/sec)]
   - Errors:         DLQ'ed: 0 (Resolved: 0) [Active Failed: 0]
 ```
-- **End-to-End Lag**: Delay from source mutation to target apply. Should remain stable and **under 1 second**.
+- **End-to-End Lag**: Delay from source mutation to target apply. Should remain stable at steady state (typically low single-digit seconds).
 - **Lags Rising Steadily**: Target write rate is lower than source mutation rate; scale target capacity or increase `incrementalStreamPartitions`.
 - **DLQ'ed / Active Failed**: If non-zero, operations are actively failing. Investigate DLQ immediately.
