@@ -24,6 +24,7 @@ const (
 	BSONTypeNumber    BSONType = "number"    // Encompasses int32, int64, double, decimal128
 	BSONTypeObjectID  BSONType = "objectId"  // 12-byte BSON ObjectId
 	BSONTypeString    BSONType = "string"    // UTF-8 string
+	BSONTypeObject    BSONType = "object"    // Embedded document / composite _id
 	BSONTypeBinary    BSONType = "binData"   // Binary data / UUID
 	BSONTypeDate      BSONType = "date"      // UTC DateTime
 	BSONTypeTimestamp BSONType = "timestamp" // BSON Timestamp
@@ -183,7 +184,7 @@ func DeletePartitionCheckpoints(dir, db, collection string) error {
 	return nil
 }
 
-// ParseBSONType maps a MongoDB $type string name (e.g. "objectId", "int", "double") to its canonical BSONType.
+// ParseBSONType maps a MongoDB $type string name (e.g. "objectId", "int", "double", "object") to its canonical BSONType.
 func ParseBSONType(typeName string) BSONType {
 	switch typeName {
 	case "int", "long", "double", "decimal":
@@ -192,6 +193,8 @@ func ParseBSONType(typeName string) BSONType {
 		return BSONTypeObjectID
 	case "string":
 		return BSONTypeString
+	case "object":
+		return BSONTypeObject
 	case "binData":
 		return BSONTypeBinary
 	case "date":
@@ -206,19 +209,22 @@ func ParseBSONType(typeName string) BSONType {
 }
 
 // GetBSONType maps a runtime BSON _id value to its canonical BSONType using the official MongoDB driver's bson.MarshalValue.
+// Returns an empty string if val is nil, unmarshal fails, or the type is unrecognized.
 func GetBSONType(val any) BSONType {
 	if val == nil {
 		return ""
 	}
 	t, _, err := bson.MarshalValue(val)
 	if err != nil {
-		return BSONTypeString
+		return ""
 	}
 	switch t {
 	case bson.TypeObjectID:
 		return BSONTypeObjectID
 	case bson.TypeString:
 		return BSONTypeString
+	case bson.TypeEmbeddedDocument:
+		return BSONTypeObject
 	case bson.TypeDouble, bson.TypeInt32, bson.TypeInt64, bson.TypeDecimal128:
 		return BSONTypeNumber
 	case bson.TypeDateTime:
@@ -230,17 +236,18 @@ func GetBSONType(val any) BSONType {
 	case bson.TypeBoolean:
 		return BSONTypeBool
 	default:
-		return BSONTypeString
+		return ""
 	}
 }
 
 // CandidateBSONTypes lists the candidate BSON types checked during _id type discovery,
 // ordered by MongoDB canonical B-tree comparison order:
-// number < string < binData < objectId < bool < date < timestamp
+// number < string < object < binData < objectId < bool < date < timestamp
 // Reference: https://www.mongodb.com/docs/manual/reference/bson-type-comparison-order/
 var CandidateBSONTypes = []BSONType{
 	BSONTypeNumber,
 	BSONTypeString,
+	BSONTypeObject,
 	BSONTypeBinary,
 	BSONTypeObjectID,
 	BSONTypeBool,
