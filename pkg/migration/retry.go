@@ -80,7 +80,10 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 		strings.Contains(errLower, "i/o timeout") ||
 		strings.Contains(errLower, "deadlineexceeded") ||
 		strings.Contains(errLower, "deadline exceeded") ||
-		strings.Contains(errLower, "deadline_exceeded") {
+		strings.Contains(errLower, "deadline_exceeded") ||
+		strings.Contains(errLower, "shutdowninprogress") ||
+		strings.Contains(errLower, "shutdown in progress") ||
+		strings.Contains(errLower, "temporarily unavailable") {
 		return ErrorTypeConnection
 	}
 

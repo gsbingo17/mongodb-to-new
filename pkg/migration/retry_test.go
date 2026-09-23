@@ -31,6 +31,12 @@ func TestClassifyError(t *testing.T) {
 		"Deadline exceeded",
 		"deadline exceeded",
 		"DEADLINE_EXCEEDED",
+		"ShutdownInProgress",
+		"shutdowninprogress",
+		"shutdown in progress",
+		"Shutdown in progress",
+		"temporarily unavailable",
+		"Temporarily Unavailable",
 	}
 	for _, msg := range connectionCases {
 		if r.ClassifyError(errors.New(msg)) != ErrorTypeConnection {
