@@ -1,10 +1,13 @@
 package migration
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
+	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -409,3 +412,109 @@ func TestExtractNamespaceFromRawEvent(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildPartitionPipelineCustomShardKey verifies pipeline construction with custom and compound shard keys.
+func TestBuildPartitionPipelineCustomShardKey(t *testing.T) {
+	// Case 1: Single custom shard key ("order_id")
+	colls1 := []config.CollectionConfig{
+		{SourceCollection: "orders", TargetCollection: "orders", ShardKey: "order_id"},
+	}
+	p1 := BuildPartitionPipeline(0, 4, "testdb", colls1)
+	if len(p1) != 2 {
+		t.Fatalf("Expected 2 stages ($match + hash), got %d", len(p1))
+	}
+	stageBytes1, err := bson.Marshal(p1[1])
+	if err != nil {
+		t.Fatalf("Failed to marshal stage: %v", err)
+	}
+	stageStr1 := string(stageBytes1)
+	if !strings.Contains(stageStr1, "$documentKey.order_id") {
+		t.Errorf("Expected pipeline to reference $documentKey.order_id for custom shard key, got: %s", stageStr1)
+	}
+
+	// Case 2: Compound shard key ("customer_id,order_id")
+	colls2 := []config.CollectionConfig{
+		{SourceCollection: "orders", TargetCollection: "orders", ShardKey: "customer_id,order_id"},
+	}
+	p2 := BuildPartitionPipeline(0, 4, "testdb", colls2)
+	stageBytes2, err := bson.Marshal(p2[1])
+	if err != nil {
+		t.Fatalf("Failed to marshal stage: %v", err)
+	}
+	stageStr2 := string(stageBytes2)
+	if !strings.Contains(stageStr2, "$documentKey.customer_id") || !strings.Contains(stageStr2, "$documentKey.order_id") || !strings.Contains(stageStr2, "$concat") {
+		t.Errorf("Expected compound pipeline to use $concat on customer_id and order_id, got: %s", stageStr2)
+	}
+
+	// Case 3: Mixed collections (orders with order_id, users with default _id)
+	colls3 := []config.CollectionConfig{
+		{SourceCollection: "orders", TargetCollection: "orders", ShardKey: "order_id"},
+		{SourceCollection: "users", TargetCollection: "users", ShardKey: ""},
+	}
+	p3 := BuildPartitionPipeline(0, 4, "testdb", colls3)
+	stageBytes3, err := bson.Marshal(p3[1])
+	if err != nil {
+		t.Fatalf("Failed to marshal stage: %v", err)
+	}
+	stageStr3 := string(stageBytes3)
+	if !strings.Contains(stageStr3, "$switch") || !strings.Contains(stageStr3, "$documentKey.order_id") || !strings.Contains(stageStr3, "$documentKey._id") {
+		t.Errorf("Expected mixed collections pipeline to use $switch, got: %s", stageStr3)
+	}
+}
+
+// TestGetCollectionsToProcessShardKeyHierarchy verifies the 3-tier precedence hierarchy for shard keys
+// (explicit config > auto-detected > default _id).
+func TestGetCollectionsToProcessShardKeyHierarchy(t *testing.T) {
+	migrator := &Migrator{
+		log: logger.New(),
+	}
+	ctx := context.Background()
+
+	// Case 1: Explicit collection config with custom shardKey should be preserved (Tier 1)
+	inputCollections := []config.CollectionConfig{
+		{
+			SourceCollection: "orders",
+			TargetCollection: "orders",
+			ShardKey:         "order_id",
+		},
+		{
+			SourceCollection: "users",
+			TargetCollection: "users",
+			ShardKey:         "", // Unspecified, should default to _id (Tier 3 fallback)
+		},
+	}
+
+	result, err := migrator.getCollectionsToProcess(ctx, nil, inputCollections)
+	if err != nil {
+		t.Fatalf("getCollectionsToProcess failed: %v", err)
+	}
+
+	if len(result) != 2 {
+		t.Fatalf("Expected 2 collections, got %d", len(result))
+	}
+
+	if result[0].ShardKey != "order_id" {
+		t.Errorf("Expected orders ShardKey to be 'order_id', got %q", result[0].ShardKey)
+	}
+
+	if result[1].ShardKey != "_id" {
+		t.Errorf("Expected users ShardKey to default to '_id', got %q", result[1].ShardKey)
+	}
+}
+
+// TestAutoDetectSourceShardKeysGracefulFallback verifies that when sourceDB or client is nil,
+// autoDetectSourceShardKeys returns an empty map without panicking.
+func TestAutoDetectSourceShardKeysGracefulFallback(t *testing.T) {
+	ctx := context.Background()
+
+	res1 := autoDetectSourceShardKeys(ctx, nil, "testdb")
+	if len(res1) != 0 {
+		t.Errorf("Expected empty map for nil sourceDB, got %v", res1)
+	}
+
+	res2 := autoDetectSourceShardKeys(ctx, nil, "")
+	if len(res2) != 0 {
+		t.Errorf("Expected empty map for empty dbName, got %v", res2)
+	}
+}
+

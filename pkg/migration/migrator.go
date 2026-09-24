@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -304,6 +305,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 			collections[i].UpsertMode = true
 		}
 	}
+	pair.Target.Collections = collections
 
 	// Sync indexes before data migration (if configured)
 	// For live mode, each replicator handles index sync during its own initial migration
@@ -651,30 +653,88 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
 }
 
-// getCollectionsToProcess determines which collections to process
-func (m *Migrator) getCollectionsToProcess(ctx context.Context, sourceDB *db.MongoDB, configCollections []config.CollectionConfig) ([]config.CollectionConfig, error) {
-	// If collections are specified in config, use them
-	if len(configCollections) > 0 {
-		m.log.Infof("Using %d collections specified in config", len(configCollections))
-		return configCollections, nil
+// autoDetectSourceShardKeys queries config.collections on a sharded MongoDB cluster to discover
+// native shard keys for all collections in dbName. Returns a map from collectionName to comma-separated shard key fields.
+// Gracefully returns an empty map if the cluster is unsharded, replica set, or if credentials lack config DB read access.
+func autoDetectSourceShardKeys(ctx context.Context, sourceDB *db.MongoDB, dbName string) map[string]string {
+	shardKeyMap := make(map[string]string)
+	if sourceDB == nil || sourceDB.GetClient() == nil || dbName == "" {
+		return shardKeyMap
 	}
 
-	// Otherwise, auto-detect all collections in the source database
-	m.log.Info("No collections specified in config. Auto-detecting all collections...")
-	sourceCollections, err := sourceDB.ListCollections(ctx)
+	configColl := sourceDB.GetClient().Database("config").Collection("collections")
+	filter := bson.D{{Key: "_id", Value: primitive.Regex{Pattern: "^" + regexp.QuoteMeta(dbName) + "\\."}}}
+	cursor, err := configColl.Find(ctx, filter)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list collections: %w", err)
+		return shardKeyMap
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var doc struct {
+			ID  string `bson:"_id"` // "dbName.collectionName"
+			Key bson.D `bson:"key"` // e.g. [ {Key: "order_id", Value: 1} ]
+		}
+		if err := cursor.Decode(&doc); err == nil {
+			collName := strings.TrimPrefix(doc.ID, dbName+".")
+			var fields []string
+			for _, elem := range doc.Key {
+				if elem.Key != "" {
+					fields = append(fields, elem.Key)
+				}
+			}
+			if len(fields) > 0 {
+				shardKeyMap[collName] = strings.Join(fields, ",")
+			}
+		}
+	}
+	return shardKeyMap
+}
+
+// getCollectionsToProcess determines which collections to process and resolves their shard keys
+func (m *Migrator) getCollectionsToProcess(ctx context.Context, sourceDB *db.MongoDB, configCollections []config.CollectionConfig) ([]config.CollectionConfig, error) {
+	collections := configCollections
+	if len(collections) == 0 {
+		m.log.Info("No collections specified in config. Auto-detecting all collections...")
+		sourceCollections, err := sourceDB.ListCollections(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list collections: %w", err)
+		}
+
+		m.log.Infof("Found %d collections in source database: %v", len(sourceCollections), sourceCollections)
+
+		// Create collection configs with same name for source and target
+		for _, collName := range sourceCollections {
+			collections = append(collections, config.CollectionConfig{
+				SourceCollection: collName,
+				TargetCollection: collName,
+			})
+		}
+	} else {
+		m.log.Infof("Using %d collections specified in config", len(configCollections))
 	}
 
-	m.log.Infof("Found %d collections in source database: %v", len(sourceCollections), sourceCollections)
+	// Resolve shard keys using 3-tier hierarchy:
+	// Tier 1: Explicit CollectionConfig.ShardKey (from config)
+	// Tier 2: Auto-detected from config.collections on source cluster
+	// Tier 3: Default fallback to "_id"
+	sourceDBName := ""
+	if sourceDB != nil {
+		sourceDBName = sourceDB.GetDatabaseName()
+	}
+	detectedKeys := autoDetectSourceShardKeys(ctx, sourceDB, sourceDBName)
 
-	// Create collection configs with same name for source and target
-	var collections []config.CollectionConfig
-	for _, collName := range sourceCollections {
-		collections = append(collections, config.CollectionConfig{
-			SourceCollection: collName,
-			TargetCollection: collName,
-		})
+	for i := range collections {
+		if collections[i].ShardKey != "" {
+			m.log.Infof("[%s.%s] Using explicitly configured shard key: %s", sourceDBName, collections[i].SourceCollection, collections[i].ShardKey)
+			continue
+		}
+		if detectedKey, ok := detectedKeys[collections[i].SourceCollection]; ok && detectedKey != "" {
+			collections[i].ShardKey = detectedKey
+			m.log.Infof("[%s.%s] Auto-detected source shard key: %s", sourceDBName, collections[i].SourceCollection, detectedKey)
+			continue
+		}
+		collections[i].ShardKey = "_id"
 	}
 
 	return collections, nil

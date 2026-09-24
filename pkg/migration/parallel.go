@@ -136,7 +136,53 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 	return ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 }
 
-// Start begins the event distribution process
+// getShardKeyFieldsForRawEvent resolves the configured shard key fields for a raw change stream event.
+// Defaults to ["_id"] if namespace or collection configuration is not found.
+func (d *EventDistributor) getShardKeyFieldsForRawEvent(rawEvent bson.Raw) []string {
+	if d.collectionConfigs == nil {
+		return []string{"_id"}
+	}
+	ns := ExtractNamespaceFromRawEvent(rawEvent)
+	if parts := strings.SplitN(ns, ".", 2); len(parts) == 2 {
+		if collCfg, ok := d.collectionConfigs[parts[0]][parts[1]]; ok {
+			return collCfg.GetShardKeyFields()
+		}
+	}
+	return []string{"_id"}
+}
+
+// extractShardKeyBytes extracts the combined raw BSON value bytes of the configured shard key fields for an event.
+func (d *EventDistributor) extractShardKeyBytes(rawEvent bson.Raw) []byte {
+	docKeyVal, err := rawEvent.LookupErr("documentKey")
+	if err != nil {
+		return nil
+	}
+	docKeyRaw := docKeyVal.Document()
+	shardKeyFields := d.getShardKeyFieldsForRawEvent(rawEvent)
+
+	var combinedBytes []byte
+	for _, field := range shardKeyFields {
+		val, err := docKeyRaw.LookupErr(field)
+		if err != nil {
+			val, err = docKeyRaw.LookupErr("_id")
+		}
+		if err == nil && val.Value != nil {
+			combinedBytes = append(combinedBytes, val.Value...)
+		}
+	}
+	return combinedBytes
+}
+
+// getWorkerIndexForRaw determines the worker index deterministically by hashing shard key bytes.
+func (d *EventDistributor) getWorkerIndexForRaw(rawEvent bson.Raw) int {
+	combinedBytes := d.extractShardKeyBytes(rawEvent)
+	if len(combinedBytes) == 0 {
+		return 0
+	}
+	hash := hashBytes(combinedBytes)
+	return ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
+}
+
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
 	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t, changeStreams: %d)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId, len(d.changeStreams))
@@ -355,27 +401,17 @@ func (d *EventDistributor) Start() error {
 				}
 			}
 
-			// Extract documentKey._id via fast binary lookup
-			docKeyVal, err := rawEvent.LookupErr("documentKey")
-			if err != nil {
-				d.log.Errorf("Invalid raw change event: missing documentKey")
-				if d.partitionTracker != nil {
-					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
-				}
-				continue
-			}
-			docKeyRaw := docKeyVal.Document()
-			docIDVal, err := docKeyRaw.LookupErr("_id")
-			if err != nil {
-				d.log.Errorf("Invalid raw change event: missing documentKey._id")
+			// Extract and hash shard key bytes to determine worker index deterministically
+			combinedBytes := d.extractShardKeyBytes(rawEvent)
+			if len(combinedBytes) == 0 {
+				d.log.Errorf("Invalid raw change event: missing shard key and documentKey._id")
 				if d.partitionTracker != nil {
 					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
 				}
 				continue
 			}
 
-			// Determine worker index deterministically by key hashing
-			hash := hashBytes(docIDVal.Value)
+			hash := hashBytes(combinedBytes)
 			workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 
 			// Dispatch event to the target worker channel
@@ -671,6 +707,34 @@ func (w *Worker) eventLoop() {
 	}
 }
 
+// getShardKeyHash computes the hash of the document's shard key for distinct ID grouping.
+// Falls back to hashing docID for unsharded collections or default _id.
+func (w *Worker) getShardKeyHash(dbName, collName string, documentKey bson.M, docID interface{}) int {
+	if !w.groupOpsByDistinctId || w.collectionConfigs == nil {
+		return hashDocumentID(docID)
+	}
+	collCfg, ok := w.collectionConfigs[dbName][collName]
+	if !ok {
+		return hashDocumentID(docID)
+	}
+	fields := collCfg.GetShardKeyFields()
+	if len(fields) == 1 && fields[0] == "_id" {
+		return hashDocumentID(docID)
+	}
+	var combinedBytes []byte
+	for _, f := range fields {
+		if val, ok := documentKey[f]; ok {
+			combinedBytes = append(combinedBytes, []byte(fmt.Sprintf("%v:", val))...)
+		} else if val, ok := documentKey["_id"]; ok {
+			combinedBytes = append(combinedBytes, []byte(fmt.Sprintf("%v:", val))...)
+		}
+	}
+	if len(combinedBytes) == 0 {
+		return hashDocumentID(docID)
+	}
+	return hashBytes(combinedBytes)
+}
+
 // ProcessEvent handles a single change event by decoding raw BSON concurrently in the worker thread
 func (w *Worker) ProcessEvent(eventArg interface{}) {
 	w.mu.Lock()
@@ -799,7 +863,7 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		SeqNum:            seqNum,
 	}
 
-	docHash := hashDocumentID(docID)
+	docHash := w.getShardKeyHash(dbName, collName, documentKey, docID)
 
 	// Check if we need to create a new group
 	var needNewGroup bool

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 )
 
 // Config represents the main configuration structure
@@ -109,6 +110,26 @@ type CollectionConfig struct {
 	SourceCollection string `json:"sourceCollection"`
 	TargetCollection string `json:"targetCollection"`
 	UpsertMode       bool   `json:"upsertMode,omitempty"` // Use upsert by default instead of insert
+	ShardKey         string `json:"shardKey,omitempty"`   // Shard key for change stream partitioning and worker routing (default: "_id")
+}
+
+// GetShardKeyFields returns the ordered list of shard key field names, defaulting to ["_id"].
+// Supports comma-separated fields for compound shard keys (e.g., "customer_id,order_id").
+func (c *CollectionConfig) GetShardKeyFields() []string {
+	if strings.TrimSpace(c.ShardKey) == "" {
+		return []string{"_id"}
+	}
+	parts := strings.Split(c.ShardKey, ",")
+	var fields []string
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			fields = append(fields, trimmed)
+		}
+	}
+	if len(fields) == 0 {
+		return []string{"_id"}
+	}
+	return fields
 }
 
 // IndexSyncConfig represents index sync configuration for a collection

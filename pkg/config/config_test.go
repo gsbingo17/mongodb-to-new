@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"reflect"
 	"testing"
 )
 
@@ -346,3 +347,39 @@ func TestLoadConfigIDTypeForPartition(t *testing.T) {
 		t.Error("Expected LoadConfig to fail validation for invalid idTypeForPartition, but it succeeded")
 	}
 }
+
+// TestGetShardKeyFields verifies shard key parsing and defaulting on CollectionConfig.
+func TestGetShardKeyFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		shardKey string
+		expected []string
+	}{
+		{
+			name:     "empty shardKey defaults to _id",
+			shardKey: "",
+			expected: []string{"_id"},
+		},
+		{
+			name:     "single field shardKey",
+			shardKey: "order_id",
+			expected: []string{"order_id"},
+		},
+		{
+			name:     "compound shardKey with whitespace",
+			shardKey: "  customer_id ,  order_id ",
+			expected: []string{"customer_id", "order_id"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := &CollectionConfig{ShardKey: tc.shardKey}
+			actual := coll.GetShardKeyFields()
+			if !reflect.DeepEqual(actual, tc.expected) {
+				t.Errorf("GetShardKeyFields() for %q: expected %v, got %v", tc.shardKey, tc.expected, actual)
+			}
+		})
+	}
+}
+
