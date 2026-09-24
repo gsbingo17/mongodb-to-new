@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -325,6 +326,9 @@ func TestGetBSONType(t *testing.T) {
 		{"Nil", nil, ""},
 		{"ObjectID", oid, BSONTypeObjectID},
 		{"String", "hello world", BSONTypeString},
+		{"ObjectBsonM", bson.M{"tenantId": "acme", "uid": 101}, BSONTypeObject},
+		{"ObjectBsonD", bson.D{{Key: "tenantId", Value: "acme"}}, BSONTypeObject},
+		{"ObjectMap", map[string]any{"k": "v"}, BSONTypeObject},
 		{"Int", int(42), BSONTypeNumber},
 		{"Int32", int32(42), BSONTypeNumber},
 		{"Int64", int64(42), BSONTypeNumber},
@@ -338,6 +342,7 @@ func TestGetBSONType(t *testing.T) {
 		{"ByteSlice", []byte{0x01, 0x02}, BSONTypeBinary},
 		{"BoolTrue", true, BSONTypeBool},
 		{"BoolFalse", false, BSONTypeBool},
+		{"UnknownChannel", make(chan int), ""},
 	}
 
 	for _, tt := range tests {
@@ -364,6 +369,29 @@ func TestDiscoverPresentBSONTypeCounts_NilCollection(t *testing.T) {
 	}
 }
 
+func TestCandidateBSONTypes_CanonicalOrder(t *testing.T) {
+	expectedOrder := []BSONType{
+		BSONTypeNumber,
+		BSONTypeString,
+		BSONTypeObject,
+		BSONTypeBinary,
+		BSONTypeObjectID,
+		BSONTypeBool,
+		BSONTypeDate,
+		BSONTypeTimestamp,
+	}
+
+	if len(CandidateBSONTypes) != len(expectedOrder) {
+		t.Fatalf("expected %d candidate BSON types, got %d", len(expectedOrder), len(CandidateBSONTypes))
+	}
+
+	for i, expected := range expectedOrder {
+		if CandidateBSONTypes[i] != expected {
+			t.Errorf("CandidateBSONTypes[%d] = %q, want %q", i, CandidateBSONTypes[i], expected)
+		}
+	}
+}
+
 func TestParseBSONType(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -375,6 +403,7 @@ func TestParseBSONType(t *testing.T) {
 		{"decimal", BSONTypeNumber},
 		{"objectId", BSONTypeObjectID},
 		{"string", BSONTypeString},
+		{"object", BSONTypeObject},
 		{"binData", BSONTypeBinary},
 		{"date", BSONTypeDate},
 		{"timestamp", BSONTypeTimestamp},

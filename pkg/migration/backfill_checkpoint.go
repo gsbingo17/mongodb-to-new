@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ const (
 	BSONTypeNumber    BSONType = "number"    // Encompasses int32, int64, double, decimal128
 	BSONTypeObjectID  BSONType = "objectId"  // 12-byte BSON ObjectId
 	BSONTypeString    BSONType = "string"    // UTF-8 string
+	BSONTypeObject    BSONType = "object"    // Embedded document / composite _id
 	BSONTypeBinary    BSONType = "binData"   // Binary data / UUID
 	BSONTypeDate      BSONType = "date"      // UTC DateTime
 	BSONTypeTimestamp BSONType = "timestamp" // BSON Timestamp
@@ -182,7 +184,7 @@ func DeletePartitionCheckpoints(dir, db, collection string) error {
 	return nil
 }
 
-// ParseBSONType maps a MongoDB $type string name (e.g. "objectId", "int", "double") to its canonical BSONType.
+// ParseBSONType maps a MongoDB $type string name (e.g. "objectId", "int", "double", "object") to its canonical BSONType.
 func ParseBSONType(typeName string) BSONType {
 	switch typeName {
 	case "int", "long", "double", "decimal":
@@ -191,6 +193,8 @@ func ParseBSONType(typeName string) BSONType {
 		return BSONTypeObjectID
 	case "string":
 		return BSONTypeString
+	case "object":
+		return BSONTypeObject
 	case "binData":
 		return BSONTypeBinary
 	case "date":
@@ -205,19 +209,22 @@ func ParseBSONType(typeName string) BSONType {
 }
 
 // GetBSONType maps a runtime BSON _id value to its canonical BSONType using the official MongoDB driver's bson.MarshalValue.
+// Returns an empty string if val is nil, unmarshal fails, or the type is unrecognized.
 func GetBSONType(val any) BSONType {
 	if val == nil {
 		return ""
 	}
 	t, _, err := bson.MarshalValue(val)
 	if err != nil {
-		return BSONTypeString
+		return ""
 	}
 	switch t {
 	case bson.TypeObjectID:
 		return BSONTypeObjectID
 	case bson.TypeString:
 		return BSONTypeString
+	case bson.TypeEmbeddedDocument:
+		return BSONTypeObject
 	case bson.TypeDouble, bson.TypeInt32, bson.TypeInt64, bson.TypeDecimal128:
 		return BSONTypeNumber
 	case bson.TypeDateTime:
@@ -229,22 +236,26 @@ func GetBSONType(val any) BSONType {
 	case bson.TypeBoolean:
 		return BSONTypeBool
 	default:
-		return BSONTypeString
+		return ""
 	}
 }
 
-// CandidateBSONTypes lists the candidate BSON types checked during _id type discovery.
+// CandidateBSONTypes lists the candidate BSON types checked during _id type discovery,
+// ordered by MongoDB canonical B-tree comparison order:
+// number < string < object < binData < objectId < bool < date < timestamp
+// Reference: https://www.mongodb.com/docs/manual/reference/bson-type-comparison-order/
 var CandidateBSONTypes = []BSONType{
-	BSONTypeObjectID,
-	BSONTypeString,
 	BSONTypeNumber,
-	BSONTypeDate,
+	BSONTypeString,
+	BSONTypeObject,
 	BSONTypeBinary,
+	BSONTypeObjectID,
 	BSONTypeBool,
+	BSONTypeDate,
 	BSONTypeTimestamp,
 }
 
-// DiscoverPresentBSONTypeCounts probes candidate types using index-covered CountDocuments queries with a limit.
+// DiscoverPresentBSONTypeCounts probes candidate types using index-covered endpoint seeks and targeted CountDocuments queries.
 func DiscoverPresentBSONTypeCounts(ctx context.Context, collection *mongo.Collection, limit int64) (map[BSONType]int64, error) {
 	if collection == nil {
 		return nil, fmt.Errorf("collection cannot be nil")
@@ -253,12 +264,80 @@ func DiscoverPresentBSONTypeCounts(ctx context.Context, collection *mongo.Collec
 		limit = 2000
 	}
 
-	countOpts := options.Count().SetLimit(limit)
 	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	typeCounts := make(map[BSONType]int64)
+	// Step 1: Fast O(1) index endpoint seeks (Global Min & Max _id)
+	var minDoc, maxDoc bson.M
+	errMin := collection.FindOne(discoverCtx, bson.D{}, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetSort(bson.D{{Key: "_id", Value: 1}})).Decode(&minDoc)
+	errMax := collection.FindOne(discoverCtx, bson.D{}, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetSort(bson.D{{Key: "_id", Value: -1}})).Decode(&maxDoc)
 
+	// If collection is empty, return empty map immediately (0 count queries)
+	if errors.Is(errMin, mongo.ErrNoDocuments) || errors.Is(errMax, mongo.ErrNoDocuments) {
+		return make(map[BSONType]int64), nil
+	}
+
+	if errMin == nil && errMax == nil && len(minDoc) > 0 && len(maxDoc) > 0 {
+		minType := GetBSONType(minDoc["_id"])
+		maxType := GetBSONType(maxDoc["_id"])
+
+		// Homogeneous collection: min and max BSON types are identical
+		if minType != "" && minType == maxType {
+			typeCounts := make(map[BSONType]int64, 1)
+			if limit == 1 {
+				// Caller only checks for type presence; minDoc already confirms existence
+				typeCounts[minType] = 1
+				return typeCounts, nil
+			}
+			filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: string(minType)}}}}
+			cnt, err := collection.CountDocuments(discoverCtx, filter, options.Count().SetLimit(limit))
+			if err != nil {
+				return nil, fmt.Errorf("failed to probe BSON type '%s': %w", minType, err)
+			}
+			if cnt > 0 {
+				typeCounts[minType] = cnt
+			}
+			return typeCounts, nil
+		}
+
+		// Mixed collection: only probe types between minType and maxType in canonical BSON order
+		minIdx, maxIdx := -1, -1
+		for i, t := range CandidateBSONTypes {
+			if t == minType {
+				minIdx = i
+			}
+			if t == maxType {
+				maxIdx = i
+			}
+			if minIdx != -1 && maxIdx != -1 {
+				break
+			}
+		}
+		if minIdx != -1 && maxIdx != -1 && minIdx < maxIdx {
+			typeCounts := make(map[BSONType]int64)
+			for i := minIdx; i <= maxIdx; i++ {
+				candType := CandidateBSONTypes[i]
+				if limit == 1 && (candType == minType || candType == maxType) {
+					// minDoc/maxDoc already confirm presence for the boundary types
+					typeCounts[candType] = 1
+					continue
+				}
+				filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: string(candType)}}}}
+				cnt, err := collection.CountDocuments(discoverCtx, filter, options.Count().SetLimit(limit))
+				if err != nil {
+					return nil, fmt.Errorf("failed to probe BSON type '%s': %w", candType, err)
+				}
+				if cnt > 0 {
+					typeCounts[candType] = cnt
+				}
+			}
+			return typeCounts, nil
+		}
+	}
+
+	// Fallback to legacy probe across all candidate types if index seek fails
+	typeCounts := make(map[BSONType]int64)
+	countOpts := options.Count().SetLimit(limit)
 	for _, bType := range CandidateBSONTypes {
 		filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: string(bType)}}}}
 		cnt, err := collection.CountDocuments(discoverCtx, filter, countOpts)
