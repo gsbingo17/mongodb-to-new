@@ -129,8 +129,8 @@ rm -f resumeToken* initialMigrationState* dlq* backfillCheckpoint*
 
 | Test Objective | Mode & Command | Notes / Guidelines |
 |---|---|---|
-| **Pure Read Throughput** (at "Now") | `./migrate --config=mongodb_replication_config.json --mode=live-only -dry-run` | Measures change stream read throughput in isolation. Target read rate $\ge 4\times$ average change rate (e.g. 25K events/sec with 16 partitions for 6K events/sec change rate). |
-| **Historical Replay** ($t-12\text{h}$ or $t-24\text{h}$) | `./migrate -mode=live-only -dry-run -live-start-timestamp="2026-06-01T06:11:47+05:30"` | Verifies read throughput when reading older oplog segments. |
+| **Pure Read Throughput** (at "Now") | `./migrate --config=mongodb_replication_config.json --mode=live-only -dry-run` | Measures change stream read throughput in isolation. Target read rate `>= 4x` average change rate (e.g. 25K events/sec with 16 partitions for 6K events/sec change rate). |
+| **Historical Replay** (`t-12h` or `t-24h`) | `./migrate --config=mongodb_replication_config.json --mode=live-only -dry-run -live-start-timestamp="2026-06-01T06:11:47+05:30"` | Verifies read throughput when reading older oplog segments. |
 | **Replication Lag Validation** | `./migrate --config=mongodb_replication_config.json --mode=live-only` | Runs against destination Firestore for **20 minutes** to measure steady-state lag without backfill. |
 
 ### Sample Benchmark Log Output
@@ -152,10 +152,10 @@ Note the `clusterTime` and `wallTime` of the first batch to ensure your backfill
 ## 4. Live Migration Runbook
 
 ### Pre-Migration Verification & State Cleanup
-If starting a fresh migration, clear state files from previous runs:
-- **DLQ Files (`dlq*.json`)**: Must be removed; the tool refuses to start if active failures exist.
-- **Initial Migration State (`initialMigrationState*.json`)**: Must be removed; otherwise the tool assumes backfill is complete and bypasses it.
-- **Resume Tokens (`resumeToken-*.json`)**: Remove for fresh unified migration. *(DO NOT remove if running decoupled pipeline after `capture-resume-token`)*.
+If starting a fresh unified migration, clear state files from previous runs:
+- **DLQ Files (`dlq*.jsonl*`)**: Must be removed; the tool refuses to start if active failures exist.
+- **Initial Migration State (`initialMigrationState*.json`)**: Remove for a fresh unified migration; otherwise the tool assumes backfill is complete and bypasses it. *(DO NOT remove if running a decoupled pipeline after `capture-resume-token`, which sets this state to `skipped` alongside the resume tokens)*.
+- **Resume Tokens (`resumeToken-*.json`)**: Remove for a fresh unified migration. *(DO NOT remove if running a decoupled pipeline after `capture-resume-token`)*.
 - **Backfill Checkpoints (`backfillCheckpoint-*.json`)**: Remove only to force a backfill from scratch. If left, the tool automatically resumes from where it stopped.
 
 ### Execution Pipelines
@@ -208,9 +208,13 @@ Once `failedCount == 0`, state updates to `Completed`. Restart `--mode=live` to 
 ## 5. Handling Interruptions with Active DLQ Failures
 
 ### Scenario A: Interrupted during Backfill
-- **Automated DLQ Backup**: Restarting `--mode=live` automatically backs up the active DLQ to `dlq.json.backup-<timestamp>`.
-- **Option 1: Resume from Checkpoints**: Restart `./migrate --config=mongodb_replication_config.json --mode=live`. Resumes from the last saved checkpoint per partition.
-- **Option 2: Fresh Restart from Scratch**: Delete `backfillCheckpoint-*.json` before restarting `--mode=live` to re-scan from scratch.
+If the backfill is interrupted (`inprogress`) and the DLQ file (`dlq-global.jsonl`) contains failed records, you have two recovery choices:
+- **Option 1: Resume from Checkpoints**:
+  1. First, reprocess any active DLQ failures from the interrupted run with `./migrate --config=mongodb_replication_config.json --mode=retry-dlq`.
+  2. Once the DLQ is cleared, restart `./migrate --config=mongodb_replication_config.json --mode=live`. The initial backfill will resume from the last saved partition checkpoints (`backfillCheckpoint-*.json`) without re-scanning completed documents (even if settings like `maxReadPartitions` changed).
+- **Option 2: Fresh Restart from Scratch**:
+  1. Remove `backfillCheckpoint-*.json` before restarting `./migrate --config=mongodb_replication_config.json --mode=live`.
+  2. On startup, `--mode=live` automatically backs up and clears the old DLQ file (`dlq-global.jsonl.backup-<timestamp>`) and re-scans all collections from scratch. Documents already copied are safely skipped via duplicate key checks, and any new failures are logged to a fresh `dlq-global.jsonl`.
 
 ### Scenario B: Interrupted during Replication
 - **Automatic Resume**: Since backfill is marked `Completed`, restarting `--mode=live` skips backfill and resumes streaming from the last watermark.
@@ -219,7 +223,7 @@ Once `failedCount == 0`, state updates to `Completed`. Restart `--mode=live` to 
   ./migrate --config=mongodb_replication_config.json --mode=retry-dlq
   ```
 > [!CAUTION]
-> Do **NOT** manually delete the DLQ file during replication. Since backfill will not rerun, deleting the DLQ causes **permanent data loss** for those records.
+> Do **NOT** manually delete the DLQ file (`dlq-global.jsonl`) during replication. Since backfill will not rerun, deleting the DLQ causes **permanent data loss** for those records.
 
 ---
 
