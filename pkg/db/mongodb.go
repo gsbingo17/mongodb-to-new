@@ -31,6 +31,7 @@ type MongoDB struct {
 	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
 	failedIndexes  []FailedIndex  // indexes that failed to be created (populated by async builds)
 	failedIndexMu  sync.Mutex     // protects failedIndexes
+	fullDocument   options.FullDocument // fullDocument mode for change streams (options.UpdateLookup, options.WhenAvailable, options.Required, options.Default)
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
@@ -145,6 +146,29 @@ func (m *MongoDB) GetClient() *mongo.Client {
 	return m.client
 }
 
+// SetFullDocumentMode sets the change stream fullDocument mode from string.
+// Supported (case-insensitive): "whenAvailable", "required", "default", "updateLookup" (default).
+func (m *MongoDB) SetFullDocumentMode(mode string) {
+	switch strings.ToLower(strings.ReplaceAll(mode, "_", "")) {
+	case "whenavailable":
+		m.fullDocument = options.WhenAvailable
+	case "required":
+		m.fullDocument = options.Required
+	case "default":
+		m.fullDocument = options.Default
+	default:
+		m.fullDocument = options.UpdateLookup
+	}
+}
+
+// GetFullDocument returns the configured FullDocument mode (defaults to options.UpdateLookup).
+func (m *MongoDB) GetFullDocument() options.FullDocument {
+	if m.fullDocument == "" {
+		return options.UpdateLookup
+	}
+	return m.fullDocument
+}
+
 // CreateChangeStream creates a change stream for a collection
 func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string, resumeToken interface{}) (*mongo.ChangeStream, error) {
 	collection := m.GetCollection(collectionName)
@@ -153,7 +177,7 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 	pipeline := mongo.Pipeline{}
 
 	// Set options
-	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
+	opts := options.ChangeStream().SetFullDocument(m.GetFullDocument())
 	if resumeToken != nil {
 		opts.SetResumeAfter(resumeToken)
 	}
@@ -182,7 +206,7 @@ func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken
 	}
 
 	// Set options
-	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
+	opts := options.ChangeStream().SetFullDocument(m.GetFullDocument())
 	if resumeToken != nil {
 		// Resume replication from a previously saved checkpoint token
 		opts.SetResumeAfter(resumeToken)
@@ -198,6 +222,8 @@ func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken
 		opts.SetBatchSize(int32(batchSize))
 		m.log.Infof("Setting change stream batch size to %d", batchSize)
 	}
+
+	m.log.Infof("Creating database-level change stream with FullDocument mode: '%s'", m.GetFullDocument())
 
 	// Create database-level change stream (watches all collections in the configured database)
 	changeStream, err := m.database.Watch(ctx, pipeline, opts)

@@ -187,6 +187,7 @@ If you want to migrate only specific collections or rename collections during mi
 - **concurrentCollections**: Number of collections to process concurrently (default: 4).
 - **incrementalReadBatchSize**: Number of change events to read at once (default: 8192).
 - **incrementalStreamPartitions**: Number of parallel sharded change stream readers at MongoDB source level (default: 1).
+- **fullDocumentMode**: Change stream full document mode for update events across all database pairs: `"updateLookup"` (default), `"whenAvailable"` (uses MongoDB 6.0+ post-images if enabled on collection), `"required"`, or `"default"`.
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
@@ -563,6 +564,8 @@ When no `collections` are specified (as above), the tool will automatically dete
             Path to log file (logs to both stdout and file when specified)
       -live-start-timestamp string
             Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
+      -full-document-mode string
+            Change stream full document mode: 'updateLookup' (default), 'whenAvailable', 'required', or 'default'
       -dry-run
             Dry run mode (skips writes, outputs partitioning recommendations on backfill)
       -help
