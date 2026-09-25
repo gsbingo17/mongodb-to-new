@@ -124,11 +124,32 @@ func (t *FieldTransformer) proactivelyConvertID(doc interface{}, dbName, collNam
 				return newDoc
 			}
 		}
+	case map[string]interface{}:
+		if id, ok := d["_id"]; ok {
+			if !t.isValidIDType(id) {
+				originalType := fmt.Sprintf("%T", id)
+				newID := serializeIDDeterministically(id)
+				if t.log != nil {
+					t.log.Infof("[%s.%s] Proactively converting invalid _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+						dbName, collName, id, originalType, newID)
+				}
+				newDoc := make(map[string]interface{}, len(d))
+				for k, v := range d {
+					newDoc[k] = v
+				}
+				newDoc["_id"] = newID
+				return newDoc
+			}
+		}
 	}
 	return doc
 }
 
 func (t *FieldTransformer) isValidIDType(id interface{}) bool {
+	return isValidIDType(id)
+}
+
+func isValidIDType(id interface{}) bool {
 	switch id.(type) {
 	case primitive.ObjectID,
 		string,
@@ -144,24 +165,12 @@ func (t *FieldTransformer) isValidIDType(id interface{}) bool {
 
 func serializeIDDeterministically(id interface{}) string {
 	switch val := id.(type) {
-	case bool:
-		return fmt.Sprintf("_converted:bool:%t", val)
-	case int32:
-		return fmt.Sprintf("_converted:int32:%d", val)
-	case int:
-		return fmt.Sprintf("_converted:int:%d", val)
-	case float64:
-		return fmt.Sprintf("_converted:double:%g", val)
-	case float32:
-		return fmt.Sprintf("_converted:float:%g", val)
 	case primitive.DateTime:
 		return fmt.Sprintf("_converted:datetime:%d", val)
 	case primitive.Timestamp:
 		return fmt.Sprintf("_converted:timestamp:%d_%d", val.T, val.I)
 	case primitive.Decimal128:
 		return fmt.Sprintf("_converted:decimal128:%s", val.String())
-	case primitive.Binary:
-		return fmt.Sprintf("_converted:binary:%x", val.Data)
 	case []interface{}:
 		data, err := json.Marshal(val)
 		if err == nil {

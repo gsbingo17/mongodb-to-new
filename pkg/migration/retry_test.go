@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -142,9 +143,16 @@ func TestRetryWithSplit(t *testing.T) {
 	r := NewRetryManager(3, 5*time.Millisecond, 20*time.Millisecond, true, 1, true, log)
 	ctx := context.Background()
 
+	dt := primitive.DateTime(1700000000000)
+	bin := primitive.Binary{Subtype: 4, Data: []byte{1, 2, 3, 4}}
+
 	batch := []interface{}{
-		bson.M{"_id": 1.23, "name": "invalid float _id"}, // Invalid type (float64)
+		bson.M{"_id": dt, "name": "invalid datetime _id"},
 		bson.M{"_id": "valid_str", "name": "valid string _id"},
+		bson.M{"_id": float64(1.23), "name": "valid float64 _id"},
+		bson.M{"_id": int32(456), "name": "valid int32 _id"},
+		bson.M{"_id": true, "name": "valid bool _id"},
+		bson.M{"_id": bin, "name": "valid binary _id"},
 	}
 
 	// Test _id conversion capability
@@ -152,10 +160,7 @@ func TestRetryWithSplit(t *testing.T) {
 		for _, doc := range b {
 			m := doc.(bson.M)
 			id := m["_id"]
-			switch id.(type) {
-			case string, int64, primitive.ObjectID:
-				// Acceptable types
-			default:
+			if !isValidIDType(id) {
 				return errors.New("_id must be an objectId, string, long")
 			}
 		}
@@ -166,10 +171,27 @@ func TestRetryWithSplit(t *testing.T) {
 		t.Fatalf("expected success after string conversion, got %v", err)
 	}
 
-	// Verify first document was converted to string
+	// Verify documents after conversion
 	res := r.convertInvalidIds(batch, nil, "test_coll")
+
+	// Invalid datetime _id should be converted to canonical string
 	firstID := res[0].(bson.M)["_id"]
-	if _, ok := firstID.(string); !ok {
-		t.Errorf("expected first _id to be converted to string, got %T (%v)", firstID, firstID)
+	if firstID != "_converted:datetime:1700000000000" {
+		t.Errorf("expected first _id to be converted to _converted:datetime:1700000000000, got %v", firstID)
+	}
+
+	// Valid types must NOT be converted to string
+	if floatID := res[2].(bson.M)["_id"]; floatID != float64(1.23) {
+		t.Errorf("expected float64 _id to remain 1.23, got %T (%v)", floatID, floatID)
+	}
+	if intID := res[3].(bson.M)["_id"]; intID != int32(456) {
+		t.Errorf("expected int32 _id to remain 456, got %T (%v)", intID, intID)
+	}
+	if boolID := res[4].(bson.M)["_id"]; boolID != true {
+		t.Errorf("expected bool _id to remain true, got %T (%v)", boolID, boolID)
+	}
+	binID, ok := res[5].(bson.M)["_id"].(primitive.Binary)
+	if !ok || binID.Subtype != bin.Subtype || !bytes.Equal(binID.Data, bin.Data) {
+		t.Errorf("expected binary _id to remain unchanged, got %T (%v)", res[5].(bson.M)["_id"], res[5].(bson.M)["_id"])
 	}
 }

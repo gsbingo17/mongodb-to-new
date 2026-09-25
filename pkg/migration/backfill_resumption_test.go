@@ -424,6 +424,50 @@ func TestBackfillResumption_CompareBSONValues(t *testing.T) {
 		if err != nil || cmpVal <= 0 {
 			t.Errorf("expected 50.5 > 50, got cmp=%d err=%v", cmpVal, err)
 		}
+
+		// Exact int64 comparison > 2^53 (lossless comparison without float64 precision truncation)
+		largeIntA := int64(9007199254740993) // 2^53 + 1
+		largeIntB := int64(9007199254740992) // 2^53
+		cmpVal, err = CompareBSONValues(largeIntA, largeIntB)
+		if err != nil || cmpVal <= 0 {
+			t.Errorf("expected largeIntA > largeIntB, got cmp=%d err=%v", cmpVal, err)
+		}
+	})
+
+	t.Run("Decimal128", func(t *testing.T) {
+		dec1, err := primitive.ParseDecimal128("123.45")
+		if err != nil {
+			t.Fatalf("failed to parse dec1: %v", err)
+		}
+		dec2, err := primitive.ParseDecimal128("123.46")
+		if err != nil {
+			t.Fatalf("failed to parse dec2: %v", err)
+		}
+		dec3, err := primitive.ParseDecimal128("123.450")
+		if err != nil {
+			t.Fatalf("failed to parse dec3: %v", err)
+		}
+
+		cmpVal, err := CompareBSONValues(dec1, dec2)
+		if err != nil || cmpVal >= 0 {
+			t.Errorf("expected dec1 < dec2, got cmp=%d err=%v", cmpVal, err)
+		}
+
+		cmpVal, err = CompareBSONValues(dec2, dec1)
+		if err != nil || cmpVal <= 0 {
+			t.Errorf("expected dec2 > dec1, got cmp=%d err=%v", cmpVal, err)
+		}
+
+		cmpVal, err = CompareBSONValues(dec1, dec3)
+		if err != nil || cmpVal != 0 {
+			t.Errorf("expected dec1 == dec3, got cmp=%d err=%v", cmpVal, err)
+		}
+
+		// Decimal128 vs int64
+		cmpVal, err = CompareBSONValues(dec1, int64(100))
+		if err != nil || cmpVal <= 0 {
+			t.Errorf("expected dec1(123.45) > int64(100), got cmp=%d err=%v", cmpVal, err)
+		}
 	})
 
 	t.Run("String", func(t *testing.T) {
