@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"fmt"
+	"math/big"
 	"sort"
+	"strconv"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -95,7 +97,30 @@ func CompareBSONValues(a, b any) (int, error) {
 		if valB, ok := b.(string); ok {
 			return cmp.Compare(valA, valB), nil
 		}
-	case int, int32, int64, float64, float32:
+	case int, int32, int64:
+		if intB, okB := toInt64(b); okB {
+			intA, _ := toInt64(valA)
+			return cmp.Compare(intA, intB), nil
+		}
+		if numA, okA := toFloat64(valA); okA {
+			if numB, okB := toFloat64(b); okB {
+				return cmp.Compare(numA, numB), nil
+			}
+		}
+	case float64, float32:
+		if numA, okA := toFloat64(valA); okA {
+			if numB, okB := toFloat64(b); okB {
+				return cmp.Compare(numA, numB), nil
+			}
+		}
+	case primitive.Decimal128:
+		if valB, ok := b.(primitive.Decimal128); ok {
+			bfA, _, errA := new(big.Float).SetPrec(128).Parse(valA.String(), 10)
+			bfB, _, errB := new(big.Float).SetPrec(128).Parse(valB.String(), 10)
+			if errA == nil && errB == nil {
+				return bfA.Cmp(bfB), nil
+			}
+		}
 		if numA, okA := toFloat64(valA); okA {
 			if numB, okB := toFloat64(b); okB {
 				return cmp.Compare(numA, numB), nil
@@ -132,6 +157,18 @@ func CompareBSONValues(a, b any) (int, error) {
 	return 0, fmt.Errorf("incompatible types for BSON comparison: %T vs %T", a, b)
 }
 
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
+}
+
 func toFloat64(v any) (float64, bool) {
 	switch n := v.(type) {
 	case int:
@@ -144,6 +181,11 @@ func toFloat64(v any) (float64, bool) {
 		return n, true
 	case float32:
 		return float64(n), true
+	case primitive.Decimal128:
+		f, err := strconv.ParseFloat(n.String(), 64)
+		if err == nil {
+			return f, true
+		}
 	}
 	return 0, false
 }

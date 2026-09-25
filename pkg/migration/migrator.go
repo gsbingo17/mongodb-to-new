@@ -1917,7 +1917,7 @@ func max(a, b int) int {
 // - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
 // - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
 func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager, workerID int, proactiveSkipEnabled *atomic.Bool) (int64, int64, error) {
-	convertInvalidIds := m.config.RetryConfig.ConvertInvalidIds && m.isLive
+	convertInvalidIds := m.config.RetryConfig.ConvertInvalidIds
 	transformer := NewFieldTransformer(m.config.DropEmptyFieldNames, m.config.ConvertLongFieldNamesInNestedDocs, convertInvalidIds, m.log)
 
 	writeStart := time.Now()
