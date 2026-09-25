@@ -833,6 +833,17 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			if docD[0].Value != tc.expectedID {
 				t.Errorf("expected converted bson.D _id to be %s, got %v (original type: %s)", tc.expectedID, docD[0].Value, tc.expectedType)
 			}
+
+			// 3. Verify map[string]interface{}
+			originalMap := map[string]interface{}{"_id": tc.originalID, "val": 1}
+			resMap, err := transformer.Transform(originalMap, "db", "coll", "id")
+			if err != nil {
+				t.Fatalf("Transform failed for map[string]interface{}: %v", err)
+			}
+			docMap := resMap.(map[string]interface{})
+			if docMap["_id"] != tc.expectedID {
+				t.Errorf("expected converted map _id to be %s, got %v (original type: %s)", tc.expectedID, docMap["_id"], tc.expectedType)
+			}
 		}
 	})
 }

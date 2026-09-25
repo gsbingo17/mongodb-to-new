@@ -12,7 +12,6 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -350,17 +349,12 @@ func (r *RetryManager) convertInvalidIds(batch []interface{}, failedIndices map[
 				// Find and possibly convert the _id field
 				for j, elem := range newDoc {
 					if elem.Key == "_id" {
-						// Check if _id is not an ObjectId, string, or int64
-						switch elem.Value.(type) {
-						case primitive.ObjectID, string, int64:
-							// These types are acceptable, no conversion needed
-						default:
-							// Log with collection and _id information
-							r.Logger.Infof("Collection '%s': Converting _id %v (type: %T) to string",
-								collectionName, elem.Value, elem.Value)
-
-							// Convert to string
-							newDoc[j].Value = fmt.Sprintf("%v", elem.Value)
+						if !isValidIDType(elem.Value) {
+							originalType := fmt.Sprintf("%T", elem.Value)
+							newID := serializeIDDeterministically(elem.Value)
+							r.Logger.Infof("Collection '%s': Converting invalid _id %v (type: %s) to string: %s",
+								collectionName, elem.Value, originalType, newID)
+							newDoc[j].Value = newID
 							convertedCount++
 						}
 						break
@@ -376,16 +370,29 @@ func (r *RetryManager) convertInvalidIds(batch []interface{}, failedIndices map[
 
 				// Check if _id needs conversion
 				if id, ok := newDoc["_id"]; ok {
-					switch id.(type) {
-					case primitive.ObjectID, string, int64:
-						// These types are acceptable, no conversion needed
-					default:
-						// Log with collection and _id information
-						r.Logger.Infof("Collection '%s': Converting _id %v (type: %T) to string",
-							collectionName, id, id)
+					if !isValidIDType(id) {
+						originalType := fmt.Sprintf("%T", id)
+						newID := serializeIDDeterministically(id)
+						r.Logger.Infof("Collection '%s': Converting invalid _id %v (type: %s) to string: %s",
+							collectionName, id, originalType, newID)
+						newDoc["_id"] = newID
+						convertedCount++
+					}
+				}
+				result[i] = newDoc
+			case map[string]interface{}:
+				newDoc := make(map[string]interface{}, len(d))
+				for k, v := range d {
+					newDoc[k] = v
+				}
 
-						// Convert to string
-						newDoc["_id"] = fmt.Sprintf("%v", id)
+				if id, ok := newDoc["_id"]; ok {
+					if !isValidIDType(id) {
+						originalType := fmt.Sprintf("%T", id)
+						newID := serializeIDDeterministically(id)
+						r.Logger.Infof("Collection '%s': Converting invalid _id %v (type: %s) to string: %s",
+							collectionName, id, originalType, newID)
+						newDoc["_id"] = newID
 						convertedCount++
 					}
 				}
