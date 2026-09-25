@@ -770,6 +770,16 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{"_id": objectID, "name": "objectID"},
 			{"_id": "string-id", "name": "string"},
 			{"_id": int64(123456), "name": "int64"},
+			{"_id": int32(456), "name": "int32"},
+			{"_id": int(987), "name": "int"},
+			{"_id": float64(12.34), "name": "float64"},
+			{"_id": float32(5.5), "name": "float32"},
+			{"_id": true, "name": "bool"},
+			{"_id": primitive.Binary{Subtype: 4, Data: []byte{1, 2, 3, 4}}, "name": "binary"},
+			{"_id": []byte{5, 6, 7, 8}, "name": "bytes"},
+			{"_id": bson.D{{Key: "tenant", Value: "a"}, {Key: "seq", Value: 1}}, "name": "bson.D"},
+			{"_id": bson.M{"tenant": "a", "seq": 1}, "name": "bson.M"},
+			{"_id": map[string]interface{}{"tenant": "a", "seq": 1}, "name": "map"},
 		}
 
 		for _, original := range docs {
@@ -778,48 +788,86 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 				t.Fatalf("Transform failed: %v", err)
 			}
 			doc := res.(bson.M)
-			if doc["_id"] != original["_id"] {
-				t.Errorf("expected _id %v, got %v", original["_id"], doc["_id"])
-			}
-			if _, exists := doc["_migrationIdConverted"]; exists {
-				t.Errorf("expected no migration conversion flag for type %T", original["_id"])
+			if diff := cmp.Diff(original["_id"], doc["_id"]); diff != "" {
+				t.Errorf("expected _id to remain unchanged for %s, diff (-want +got):\n%s", original["name"], diff)
 			}
 		}
 	})
 
 	t.Run("Invalid types should be proactively converted", func(t *testing.T) {
+		dec128, err := primitive.ParseDecimal128("123.45")
+		if err != nil {
+			t.Fatalf("failed to parse decimal128: %v", err)
+		}
 		type testCase struct {
 			originalID   interface{}
 			expectedID   string
 			expectedType string
 		}
 		cases := []testCase{
-			{originalID: true, expectedID: "_converted:bool:true", expectedType: "bool"},
-			{originalID: int(987), expectedID: "_converted:int:987", expectedType: "int"},
-			{originalID: int32(456), expectedID: "_converted:int32:456", expectedType: "int32"},
-			{originalID: float64(12.34), expectedID: "_converted:double:12.34", expectedType: "float64"},
+			{originalID: primitive.DateTime(1700000000000), expectedID: "_converted:datetime:1700000000000", expectedType: "primitive.DateTime"},
+			{originalID: primitive.Timestamp{T: 1700000000, I: 5}, expectedID: "_converted:timestamp:1700000000_5", expectedType: "primitive.Timestamp"},
+			{originalID: dec128, expectedID: "_converted:decimal128:123.45", expectedType: "primitive.Decimal128"},
 			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
-			{originalID: bson.D{{"x", "y"}}, expectedID: "_converted:document:[{\"Key\":\"x\",\"Value\":\"y\"}]", expectedType: "primitive.D"},
+			{originalID: []interface{}{"a", "b"}, expectedID: "_converted:array:[\"a\",\"b\"]", expectedType: "[]interface{}"},
 		}
 
 		for _, tc := range cases {
-			original := bson.M{"_id": tc.originalID}
-			res, err := transformer.Transform(original, "db", "coll", "id")
+			// 1. Verify bson.M
+			originalM := bson.M{"_id": tc.originalID}
+			resM, err := transformer.Transform(originalM, "db", "coll", "id")
 			if err != nil {
-				t.Fatalf("Transform failed: %v", err)
+				t.Fatalf("Transform failed for bson.M: %v", err)
 			}
-			doc := res.(bson.M)
-			if doc["_id"] != tc.expectedID {
-				t.Errorf("expected converted _id to be %s, got %v (original type: %s)", tc.expectedID, doc["_id"], tc.expectedType)
+			docM := resM.(bson.M)
+			if docM["_id"] != tc.expectedID {
+				t.Errorf("expected converted bson.M _id to be %s, got %v (original type: %s)", tc.expectedID, docM["_id"], tc.expectedType)
 			}
-			if _, exists := doc["_migrationIdConverted"]; exists {
-				t.Errorf("expected no _migrationIdConverted flag, but found it")
+
+			// 2. Verify bson.D
+			originalD := bson.D{{Key: "_id", Value: tc.originalID}, {Key: "val", Value: 1}}
+			resD, err := transformer.Transform(originalD, "db", "coll", "id")
+			if err != nil {
+				t.Fatalf("Transform failed for bson.D: %v", err)
 			}
-			if _, exists := doc["_migrationOriginalIdType"]; exists {
-				t.Errorf("expected no _migrationOriginalIdType flag, but found it")
+			docD := resD.(bson.D)
+			if docD[0].Value != tc.expectedID {
+				t.Errorf("expected converted bson.D _id to be %s, got %v (original type: %s)", tc.expectedID, docD[0].Value, tc.expectedType)
 			}
 		}
 	})
+}
+
+func TestTransformBatch_ConvertInvalidIdsOnly(t *testing.T) {
+	log := logger.New()
+	// Only convertInvalidIds is enabled (matches default production backfill settings)
+	transformer := NewFieldTransformer(false, false, true, log)
+
+	dt := primitive.DateTime(1700000000000)
+	compositeID := bson.D{{Key: "region", Value: "us"}, {Key: "id", Value: int32(42)}}
+
+	batch := []interface{}{
+		bson.D{{Key: "_id", Value: dt}, {Key: "name", Value: "date_doc"}},
+		bson.D{{Key: "_id", Value: compositeID}, {Key: "name", Value: "composite_doc"}},
+	}
+
+	res, err := transformer.TransformBatch(batch, "db", "coll")
+	if err != nil {
+		t.Fatalf("TransformBatch failed: %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("expected 2 documents in batch, got %d", len(res))
+	}
+
+	doc0 := res[0].(bson.D)
+	if doc0[0].Value != "_converted:datetime:1700000000000" {
+		t.Errorf("expected DateTime _id to be converted in TransformBatch, got %v", doc0[0].Value)
+	}
+
+	doc1 := res[1].(bson.D)
+	if diff := cmp.Diff(compositeID, doc1[0].Value); diff != "" {
+		t.Errorf("expected composite bson.D _id to remain unchanged in TransformBatch, diff (-want +got):\n%s", diff)
+	}
 }
 
 func BenchmarkTransformStandardDoc(b *testing.B) {

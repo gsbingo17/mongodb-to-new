@@ -81,6 +81,9 @@ func (t *FieldTransformer) Transform(doc interface{}, dbName, collName string, d
 	if doc != nil && t.convertInvalidIds {
 		doc = t.proactivelyConvertID(doc, dbName, collName)
 	}
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
+		return doc, nil
+	}
 	return t.transformFieldNamesRecursive(doc, dbName, collName, docID, true)
 }
 
@@ -127,7 +130,13 @@ func (t *FieldTransformer) proactivelyConvertID(doc interface{}, dbName, collNam
 
 func (t *FieldTransformer) isValidIDType(id interface{}) bool {
 	switch id.(type) {
-	case primitive.ObjectID, string, int64:
+	case primitive.ObjectID,
+		string,
+		int64, int32, int,
+		float64, float32,
+		bool,
+		primitive.Binary, []byte,
+		bson.D, bson.M, map[string]interface{}:
 		return true
 	default:
 		return false
@@ -148,6 +157,10 @@ func serializeIDDeterministically(id interface{}) string {
 		return fmt.Sprintf("_converted:float:%g", val)
 	case primitive.DateTime:
 		return fmt.Sprintf("_converted:datetime:%d", val)
+	case primitive.Timestamp:
+		return fmt.Sprintf("_converted:timestamp:%d_%d", val.T, val.I)
+	case primitive.Decimal128:
+		return fmt.Sprintf("_converted:decimal128:%s", val.String())
 	case primitive.Binary:
 		return fmt.Sprintf("_converted:binary:%x", val.Data)
 	case []interface{}:
@@ -421,7 +434,7 @@ func bsonValueToInterface(v interface{}) interface{} {
 // TransformBatch applies Transform to each document in a batch.
 // Extracts _id from each document for logging context.
 func (t *FieldTransformer) TransformBatch(batch []interface{}, dbName, collName string) ([]interface{}, error) {
-	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs && !t.convertInvalidIds {
 		return batch, nil
 	}
 	result := make([]interface{}, len(batch))
