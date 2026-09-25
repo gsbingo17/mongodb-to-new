@@ -135,8 +135,7 @@ func (t *FieldTransformer) isValidIDType(id interface{}) bool {
 		int64, int32, int,
 		float64, float32,
 		bool,
-		primitive.Binary, []byte,
-		bson.D, bson.M, map[string]interface{}:
+		primitive.Binary, []byte:
 		return true
 	default:
 		return false
@@ -176,7 +175,7 @@ func serializeIDDeterministically(id interface{}) string {
 		}
 		return fmt.Sprintf("_converted:array:%v", val)
 	case bson.D, bson.M, map[string]interface{}:
-		data, err := json.Marshal(val)
+		data, err := json.Marshal(bsonValueToInterface(val))
 		if err == nil {
 			return fmt.Sprintf("_converted:document:%s", string(data))
 		}

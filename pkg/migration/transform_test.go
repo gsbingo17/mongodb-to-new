@@ -777,9 +777,6 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{"_id": true, "name": "bool"},
 			{"_id": primitive.Binary{Subtype: 4, Data: []byte{1, 2, 3, 4}}, "name": "binary"},
 			{"_id": []byte{5, 6, 7, 8}, "name": "bytes"},
-			{"_id": bson.D{{Key: "tenant", Value: "a"}, {Key: "seq", Value: 1}}, "name": "bson.D"},
-			{"_id": bson.M{"tenant": "a", "seq": 1}, "name": "bson.M"},
-			{"_id": map[string]interface{}{"tenant": "a", "seq": 1}, "name": "map"},
 		}
 
 		for _, original := range docs {
@@ -809,6 +806,8 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{originalID: primitive.Timestamp{T: 1700000000, I: 5}, expectedID: "_converted:timestamp:1700000000_5", expectedType: "primitive.Timestamp"},
 			{originalID: dec128, expectedID: "_converted:decimal128:123.45", expectedType: "primitive.Decimal128"},
 			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
+			{originalID: bson.D{{Key: "x", Value: "y"}, {Key: "a", Value: 1}}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.D"},
+			{originalID: bson.M{"x": "y", "a": 1}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.M"},
 			{originalID: []interface{}{"a", "b"}, expectedID: "_converted:array:[\"a\",\"b\"]", expectedType: "[]interface{}"},
 		}
 
@@ -865,8 +864,9 @@ func TestTransformBatch_ConvertInvalidIdsOnly(t *testing.T) {
 	}
 
 	doc1 := res[1].(bson.D)
-	if diff := cmp.Diff(compositeID, doc1[0].Value); diff != "" {
-		t.Errorf("expected composite bson.D _id to remain unchanged in TransformBatch, diff (-want +got):\n%s", diff)
+	expectedComposite := `_converted:document:{"id":42,"region":"us"}`
+	if doc1[0].Value != expectedComposite {
+		t.Errorf("expected composite bson.D _id to be converted to %s in TransformBatch, got %v", expectedComposite, doc1[0].Value)
 	}
 }
 
