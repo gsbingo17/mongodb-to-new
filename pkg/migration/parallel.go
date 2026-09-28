@@ -23,6 +23,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -671,12 +672,76 @@ func (w *Worker) eventLoop() {
 	}
 }
 
+func parseRawChangeEvent(raw bson.Raw) (opType, dbName, collName string, docID interface{}, fullDoc, updateDesc interface{}, eventTime time.Time, err error) {
+	if err := raw.Validate(); err != nil {
+		return "", "", "", nil, nil, nil, time.Time{}, err
+	}
+	if opVal, err := raw.LookupErr("operationType"); err == nil {
+		opType = opVal.StringValue()
+	}
+	if nsVal, err := raw.LookupErr("ns"); err == nil {
+		if nsDoc, ok := nsVal.DocumentOK(); ok {
+			dbName = nsDoc.Lookup("db").StringValue()
+			collName = nsDoc.Lookup("coll").StringValue()
+		}
+	}
+	if docKeyVal, err := raw.LookupErr("documentKey"); err == nil {
+		if docKeyDoc, ok := docKeyVal.DocumentOK(); ok {
+			if idVal, err := docKeyDoc.LookupErr("_id"); err == nil {
+				if idVal.Type == bsontype.EmbeddedDocument {
+					var d bson.D
+					if err := idVal.Unmarshal(&d); err == nil {
+						docID = d
+					}
+				} else {
+					var idInterface interface{}
+					if err := idVal.Unmarshal(&idInterface); err == nil {
+						docID = idInterface
+					}
+				}
+			}
+		}
+	}
+	if fullDocVal, err := raw.LookupErr("fullDocument"); err == nil {
+		if fullDocDoc, ok := fullDocVal.DocumentOK(); ok {
+			fullDoc = fullDocDoc
+		}
+	}
+	if updVal, err := raw.LookupErr("updateDescription"); err == nil {
+		if updDoc, ok := updVal.DocumentOK(); ok {
+			updateDesc = updDoc
+		}
+	}
+	eventTime = ExtractEventTimeFromRaw(raw)
+	return opType, dbName, collName, docID, fullDoc, updateDesc, eventTime, nil
+}
+
+func parseBsonMChangeEvent(event bson.M) (opType, dbName, collName string, docID interface{}, fullDoc, updateDesc interface{}, eventTime time.Time) {
+	opType, _ = event["operationType"].(string)
+	if ns, ok := event["ns"].(bson.M); ok {
+		dbName, _ = ns["db"].(string)
+		collName, _ = ns["coll"].(string)
+	}
+	if documentKey, ok := event["documentKey"].(bson.M); ok {
+		docID = documentKey["_id"]
+	}
+	fullDoc = event["fullDocument"]
+	updateDesc = event["updateDescription"]
+	eventTime = ExtractEventTime(event)
+	return
+}
+
 // ProcessEvent handles a single change event by decoding raw BSON concurrently in the worker thread
 func (w *Worker) ProcessEvent(eventArg interface{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	var event bson.M
+	var opType string
+	var dbName, collName string
+	var docID interface{}
+	var fullDocument interface{}
+	var updateDescription interface{}
+	var eventTime time.Time
 	var readTime time.Time
 	var streamIndex int
 	var seqNum uint64
@@ -692,16 +757,18 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 			w.incrementalStatsManager.RecordQueueDelays(ingestQueueDelay, batchingQueueDelay)
 		}
 		switch inner := e.Event.(type) {
-		case bson.M:
-			event = inner
 		case bson.Raw:
-			if err := bson.Unmarshal(inner, &event); err != nil {
-				w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
+			var err error
+			opType, dbName, collName, docID, fullDocument, updateDescription, eventTime, err = parseRawChangeEvent(inner)
+			if err != nil {
+				w.log.Errorf("Failed to parse raw BSON change event: %v", err)
 				if w.partitionTracker != nil {
 					w.partitionTracker.Ack(streamIndex, seqNum)
 				}
 				return
 			}
+		case bson.M:
+			opType, dbName, collName, docID, fullDocument, updateDescription, eventTime = parseBsonMChangeEvent(inner)
 		default:
 			w.log.Errorf("Invalid inner event type: %T", e.Event)
 			if w.partitionTracker != nil {
@@ -709,17 +776,19 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 			}
 			return
 		}
+	case bson.Raw:
+		var err error
+		opType, dbName, collName, docID, fullDocument, updateDescription, eventTime, err = parseRawChangeEvent(e)
+		if err != nil {
+			w.log.Errorf("Failed to parse raw BSON change event: %v", err)
+			return
+		}
 	case bson.M:
-		event = e
-		if rt, exists := event["readTime"]; exists {
+		opType, dbName, collName, docID, fullDocument, updateDescription, eventTime = parseBsonMChangeEvent(e)
+		if rt, exists := e["readTime"]; exists {
 			if t, ok := rt.(time.Time); ok {
 				readTime = t
 			}
-		}
-	case bson.Raw:
-		if err := bson.Unmarshal(e, &event); err != nil {
-			w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
-			return
 		}
 	default:
 		w.log.Errorf("Invalid event type in ProcessEvent: %T", eventArg)
@@ -730,18 +799,10 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		readTime = time.Now()
 	}
 
-	// Extract operation details
-	opType, _ := event["operationType"].(string)
+	namespace := fmt.Sprintf("%s.%s", dbName, collName)
 	if w.incrementalStatsManager != nil {
 		w.incrementalStatsManager.IncrementEventsWorkerReceived(opType)
 	}
-	ns, _ := event["ns"].(bson.M)
-	dbName, _ := ns["db"].(string)
-	collName, _ := ns["coll"].(string)
-	namespace := fmt.Sprintf("%s.%s", dbName, collName)
-
-	documentKey, _ := event["documentKey"].(bson.M)
-	docID := documentKey["_id"]
 
 	if w.transformer != nil && w.transformer.convertInvalidIds && !w.transformer.isValidIDType(docID) {
 		originalType := fmt.Sprintf("%T", docID)
@@ -749,14 +810,7 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		w.log.Infof("[%s] Proactively converting change stream documentKey _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
 			namespace, docID, originalType, convertedID)
 		docID = convertedID
-		if documentKey != nil {
-			documentKey["_id"] = docID
-		}
 	}
-
-	// Get fullDocument as interface{} to support both bson.M and map[string]interface{}
-	// This is needed because legacy oplog replicator returns map[string]interface{}
-	fullDocument := event["fullDocument"]
 
 	// Graceful Null Document Update Skipping (Decoupled Logic Fix):
 	// In MongoDB change streams, an update event that is immediately followed by a delete can arrive with a nil
@@ -775,11 +829,9 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		return
 	}
 
-	// Get updateDescription for modifier updates ($set, $inc, etc.)
-	var updateDescription interface{}
-
-	// Extract clusterTime or wallTime for lag tracking
-	eventTime := ExtractEventTime(event)
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
 
 	// Debug log for worker events
 	w.log.Debugf("received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",

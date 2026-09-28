@@ -679,3 +679,77 @@ func TestIsDuplicateKeyError(t *testing.T) {
 	}
 }
 
+func TestWorkerProcessRawEventCompositeIDOrderPreserved(t *testing.T) {
+	log := logger.New()
+	ctx := context.Background()
+	transformer := NewFieldTransformer(false, false, true, log)
+	worker := NewWorker(
+		1,
+		ctx,
+		log,
+		nil,
+		nil,
+		10,
+		false,
+		nil,
+		nil,
+		nil,
+		true,
+		5*time.Minute,
+		8192,
+		2,
+		transformer,
+	)
+
+	// Create a raw BSON event with a composite document _id having non-alphabetical key order: {z: 100, a: 200}
+	compositeID := bson.D{{Key: "z", Value: int32(100)}, {Key: "a", Value: int32(200)}}
+	fullDoc := bson.D{{Key: "_id", Value: compositeID}, {Key: "payload", Value: "test_data"}}
+	fullDocBytes, err := bson.Marshal(fullDoc)
+	if err != nil {
+		t.Fatalf("failed to marshal fullDoc: %v", err)
+	}
+
+	rawEventBytes, err := bson.Marshal(bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "testdb"}, {Key: "coll", Value: "testcoll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: compositeID}}},
+		{Key: "fullDocument", Value: bson.Raw(fullDocBytes)},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal rawEvent: %v", err)
+	}
+
+	queueEvent := QueueEvent{
+		Event:       bson.Raw(rawEventBytes),
+		ReadTime:    time.Now(),
+		StreamIndex: 0,
+		SeqNum:      1,
+	}
+
+	worker.ProcessEvent(queueEvent)
+
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+
+	if worker.currentGroup == nil || len(worker.currentGroup.Operations) == 0 {
+		t.Fatalf("expected currentGroup with 1 operation, got nil or empty")
+	}
+
+	op := worker.currentGroup.Operations[0]
+	expectedID := `_converted:document:{"z":100,"a":200}`
+	if op.DocumentID != expectedID {
+		t.Errorf("expected converted DocumentID to be %s (slice order preserved), got %v", expectedID, op.DocumentID)
+	}
+
+	// Verify Backfill produces the exact same converted string for the same document
+	backfillDoc := bson.D{{Key: "_id", Value: compositeID}, {Key: "payload", Value: "test_data"}}
+	backfilled, err := transformer.Transform(backfillDoc, "testdb", "testcoll", nil)
+	if err != nil {
+		t.Fatalf("Backfill Transform failed: %v", err)
+	}
+	backfilledDoc := backfilled.(bson.D)
+	if backfilledDoc[0].Value != expectedID {
+		t.Errorf("Backfill transformed ID mismatch: want %s, got %v", expectedID, backfilledDoc[0].Value)
+	}
+}
+

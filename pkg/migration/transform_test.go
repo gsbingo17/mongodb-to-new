@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"strings"
@@ -806,7 +807,8 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{originalID: primitive.Timestamp{T: 1700000000, I: 5}, expectedID: "_converted:timestamp:1700000000_5", expectedType: "primitive.Timestamp"},
 			{originalID: dec128, expectedID: "_converted:decimal128:123.45", expectedType: "primitive.Decimal128"},
 			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
-			{originalID: bson.D{{Key: "x", Value: "y"}, {Key: "a", Value: 1}}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.D"},
+			{originalID: bson.D{{Key: "x", Value: "y"}, {Key: "a", Value: 1}}, expectedID: `_converted:document:{"x":"y","a":1}`, expectedType: "primitive.D"},
+			{originalID: bson.D{{Key: "a", Value: 1}, {Key: "x", Value: "y"}}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.D"},
 			{originalID: bson.M{"x": "y", "a": 1}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.M"},
 			{originalID: []interface{}{"a", "b"}, expectedID: "_converted:array:[\"a\",\"b\"]", expectedType: "[]interface{}"},
 		}
@@ -875,9 +877,62 @@ func TestTransformBatch_ConvertInvalidIdsOnly(t *testing.T) {
 	}
 
 	doc1 := res[1].(bson.D)
-	expectedComposite := `_converted:document:{"id":42,"region":"us"}`
+	expectedComposite := `_converted:document:{"region":"us","id":42}`
 	if doc1[0].Value != expectedComposite {
 		t.Errorf("expected composite bson.D _id to be converted to %s in TransformBatch, got %v", expectedComposite, doc1[0].Value)
+	}
+}
+
+func TestTransformRawBSON(t *testing.T) {
+	log := logger.New()
+	fastPathTransformer := NewFieldTransformer(false, false, true, log)
+	fullTransformer := NewFieldTransformer(true, true, true, log)
+
+	// 1. Clean raw BSON (fast-path: returned as-is)
+	cleanRaw, err := bson.Marshal(bson.D{
+		{Key: "_id", Value: "clean_id"},
+		{Key: "foo", Value: "bar"},
+		{Key: "nested", Value: bson.D{{Key: "k2", Value: 2}, {Key: "k1", Value: 1}}},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal clean raw: %v", err)
+	}
+
+	resClean, err := fastPathTransformer.Transform(cleanRaw, "db", "coll", "clean_id")
+	if err != nil {
+		t.Fatalf("Transform failed on cleanRaw: %v", err)
+	}
+	resRaw, ok := resClean.(bson.Raw)
+	if !ok {
+		t.Fatalf("expected clean raw BSON to be preserved as bson.Raw on fast-path, got %T", resClean)
+	}
+	if !bytes.Equal(resRaw, cleanRaw) {
+		t.Errorf("expected fast-path raw bytes to be byte-for-byte identical")
+	}
+
+	// 2. Raw BSON with invalid composite _id (transformed to bson.D preserving slice order)
+	compositeRaw, err := bson.Marshal(bson.D{
+		{Key: "_id", Value: bson.D{{Key: "z", Value: 99}, {Key: "a", Value: 1}}},
+		{Key: "payload", Value: "test"},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal composite raw: %v", err)
+	}
+
+	resComposite, err := fullTransformer.Transform(compositeRaw, "db", "coll", nil)
+	if err != nil {
+		t.Fatalf("Transform failed on compositeRaw: %v", err)
+	}
+	docD, ok := resComposite.(bson.D)
+	if !ok {
+		t.Fatalf("expected transformed raw BSON with invalid _id to be bson.D, got %T", resComposite)
+	}
+	expectedID := `_converted:document:{"z":99,"a":1}`
+	if docD[0].Value != expectedID {
+		t.Errorf("expected converted _id to be %s, got %v", expectedID, docD[0].Value)
+	}
+	if docD[1].Key != "payload" || docD[1].Value != "test" {
+		t.Errorf("expected payload to be preserved in slice order, got %v", docD[1])
 	}
 }
 
