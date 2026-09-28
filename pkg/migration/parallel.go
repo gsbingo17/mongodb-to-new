@@ -703,13 +703,13 @@ func parseRawChangeEvent(raw bson.Raw) (opType, dbName, collName string, docID i
 		}
 	}
 	if fullDocVal, err := raw.LookupErr("fullDocument"); err == nil {
-		if fullDocDoc, ok := fullDocVal.DocumentOK(); ok {
-			fullDoc = fullDocDoc
+		if rawFullDoc, ok := fullDocVal.DocumentOK(); ok {
+			fullDoc = rawFullDoc
 		}
 	}
 	if updVal, err := raw.LookupErr("updateDescription"); err == nil {
-		if updDoc, ok := updVal.DocumentOK(); ok {
-			updateDesc = updDoc
+		if rawUpdDoc, ok := updVal.DocumentOK(); ok {
+			updateDesc = rawUpdDoc
 		}
 	}
 	eventTime = ExtractEventTimeFromRaw(raw)

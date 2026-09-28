@@ -239,15 +239,18 @@ If you want to migrate only specific collections or rename collections during mi
   - **enableBatchSplitting**: Enable batch splitting for contention errors (default: true).
   - **minBatchSize**: Minimum batch size for splitting (default: 10).
   - **convertInvalidIds**: Automatically convert invalid `_id` types to string (default: `true`).
+    - **Valid Native Firestore `_id` Types (Preserved as-is):** `ObjectID`, `string`, `int`, `int32`, `int64`, `float64`, `float32`, `bool`, `binary` (`primitive.Binary`), and `[]byte`.
     - **In Live Paths (Live Backfill & Live Incremental streaming):** Proactively detects unsupported `_id` datatypes before writing to the target, and serializes them into deterministic type-prefixed strings.
+      * *Supported type mappings for unsupported datatypes:* `datetime` (`_converted:datetime:`), `timestamp` (`_converted:timestamp:`), `decimal128` (`_converted:decimal128:`), `array` (`_converted:array:`), `document` (`_converted:document:`).
+      * *Example BSON ID conversions:*
+        - **Source ID:** `_id: [1, 2] (Array)`
+        - **Target ID:** `_id: "_converted:array:[1,2]" (String)`
+        - **Source ID:** `_id: { "region": "us", "id": 42 } (Document)`
+        - **Target ID:** `_id: "_converted:document:{\"region\":\"us\",\"id\":42}" (String, exact slice order preserved)`
+    - **In Normal Backfill (`-mode=migrate`):** Reactively catches database write failures (due to invalid `_id` types), splits the batch, converts failing invalid `_id` values to deterministic type-prefixed strings, and retries.
       * *Example BSON ID conversion:*
         - **Source ID:** `_id: [1, 2] (Array)`
         - **Target ID:** `_id: "_converted:array:[1,2]" (String)`
-      * *Supported type mappings:* `bool` (`_converted:bool:`), `int` (`_converted:int:`), `int32` (`_converted:int32:`), `double` (`_converted:double:`), `float` (`_converted:float:`), `datetime` (`_converted:datetime:`), `binary` (`_converted:binary:`), `array` (`_converted:array:`), `document` (`_converted:document:`).
-    - **In Normal Backfill (`-mode=migrate`):** Reactively catches database write failures (due to invalid `_id` types), splits the batch, converts failing invalid `_id` values to string using simple formatting, and retries.
-      * *Example BSON ID conversion:*
-        - **Source ID:** `_id: [1, 2] (Array)`
-        - **Target ID:** `_id: "[1 2]" (String)`
 
 #### Field Transformation Configuration
 - **dropEmptyFieldNames**: Automatically remove empty field names (e.g., `""`) from document keys to satisfy target compatibility (default: `false`).
@@ -736,11 +739,12 @@ The application includes a sophisticated retry mechanism for handling errors:
    - Invalid _id type errors: Automatic conversion of _id fields to strings when enabled
 
 5. **_id Type Conversion**: When `convertInvalidIds` is enabled:
-   - Detects errors like "_id must be an objectId, string, long; found int"
-   - Automatically converts problematic _id fields to strings
-   - Logs the conversion details for troubleshooting
-   - Retries the operation with the converted _id fields
-   - Only converts _id fields that cause errors, preserving the original types when possible
+   - Preserves all valid native Firestore types: `ObjectID`, `string`, integers (`int`, `int32`, `int64`), floats (`float64`, `float32`), `bool`, and `binary` (`[]byte`).
+   - Proactively (in live paths) or reactively (during batch retry in backfill) detects unsupported `_id` types such as arrays, composite documents, timestamps, or decimals.
+   - Automatically converts problematic `_id` fields to deterministic type-prefixed strings (e.g. `_converted:array:[1,2]`, `_converted:document:{...}`).
+   - Preserves exact key slice ordering for composite document `_id`s.
+   - Logs the conversion details with database, collection, and document ID context.
+   - Retries the operation with the converted `_id` fields.
 
 ## Setting Up a Single-Node Replica Set for Development
 
