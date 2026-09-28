@@ -809,7 +809,6 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
 			{originalID: bson.D{{Key: "x", Value: "y"}, {Key: "a", Value: 1}}, expectedID: `_converted:document:{"x":"y","a":1}`, expectedType: "primitive.D"},
 			{originalID: bson.D{{Key: "a", Value: 1}, {Key: "x", Value: "y"}}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.D"},
-			{originalID: bson.M{"x": "y", "a": 1}, expectedID: `_converted:document:{"a":1,"x":"y"}`, expectedType: "primitive.M"},
 			{originalID: []interface{}{"a", "b"}, expectedID: "_converted:array:[\"a\",\"b\"]", expectedType: "[]interface{}"},
 		}
 

@@ -200,7 +200,7 @@ func isValidIDType(id interface{}) bool {
 	}
 }
 
-func serializeIDDeterministically(id interface{}) string {
+func serializeIDDeterministically(id any) string {
 	switch val := id.(type) {
 	case primitive.DateTime:
 		return fmt.Sprintf("_converted:datetime:%d", val)
@@ -208,7 +208,7 @@ func serializeIDDeterministically(id interface{}) string {
 		return fmt.Sprintf("_converted:timestamp:%d_%d", val.T, val.I)
 	case primitive.Decimal128:
 		return fmt.Sprintf("_converted:decimal128:%s", val.String())
-	case []interface{}:
+	case []any:
 		data, err := json.Marshal(val)
 		if err == nil {
 			return fmt.Sprintf("_converted:array:%s", string(data))
@@ -222,12 +222,6 @@ func serializeIDDeterministically(id interface{}) string {
 		return fmt.Sprintf("_converted:array:%v", val)
 	case bson.D:
 		data, err := marshalBsonDOrderedJSON(val)
-		if err == nil {
-			return fmt.Sprintf("_converted:document:%s", string(data))
-		}
-		return fmt.Sprintf("_converted:document:%v", val)
-	case bson.M, map[string]interface{}:
-		data, err := json.Marshal(bsonValueToInterface(val))
 		if err == nil {
 			return fmt.Sprintf("_converted:document:%s", string(data))
 		}
@@ -482,7 +476,7 @@ func marshalBsonDOrderedJSON(d bson.D) ([]byte, error) {
 
 // marshalBSONValueOrderedJSON recursively marshals BSON values to JSON while preserving
 // bson.D key ordering and bson.A array ordering.
-func marshalBSONValueOrderedJSON(v interface{}) ([]byte, error) {
+func marshalBSONValueOrderedJSON(v any) ([]byte, error) {
 	switch val := v.(type) {
 	case bson.D:
 		return marshalBsonDOrderedJSON(val)
@@ -501,7 +495,7 @@ func marshalBSONValueOrderedJSON(v interface{}) ([]byte, error) {
 		}
 		buf.WriteByte(']')
 		return buf.Bytes(), nil
-	case []interface{}:
+	case []any:
 		var buf bytes.Buffer
 		buf.WriteByte('[')
 		for i, item := range val {
@@ -516,8 +510,6 @@ func marshalBSONValueOrderedJSON(v interface{}) ([]byte, error) {
 		}
 		buf.WriteByte(']')
 		return buf.Bytes(), nil
-	case bson.M, map[string]interface{}:
-		return json.Marshal(bsonValueToInterface(val))
 	default:
 		return json.Marshal(val)
 	}

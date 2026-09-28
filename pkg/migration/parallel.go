@@ -430,7 +430,7 @@ func (d *EventDistributor) savePartitionResumeToken(partitionIndex int, resumeTo
 
 // QueueEvent wraps the raw change stream or oplog event with metadata like read time
 type QueueEvent struct {
-	Event               interface{} // bson.M or bson.Raw
+	Event               any // bson.Raw or bson.D
 	ReadTime            time.Time
 	DistributorTime     time.Time
 	DistributorPushTime time.Time
@@ -440,10 +440,10 @@ type QueueEvent struct {
 
 // WriteOperation represents a single write operation
 type WriteOperation struct {
-	DocumentID          interface{}
-	Document            interface{}
-	TransformedDocument interface{} // Pre-calculated transformed document for Firestore/Spanner compatibility
-	UpdateDescription   interface{} // For modifier updates ($set, $inc, etc.)
+	DocumentID          any
+	Document            any
+	TransformedDocument any // Pre-calculated transformed document for Firestore/Spanner compatibility
+	UpdateDescription   any // For modifier updates ($set, $inc, etc.)
 	Namespace           string
 	OpType              string
 	// Stats
@@ -672,17 +672,29 @@ func (w *Worker) eventLoop() {
 	}
 }
 
-func parseRawChangeEvent(raw bson.Raw) (opType, dbName, collName string, docID interface{}, fullDoc, updateDesc interface{}, eventTime time.Time, err error) {
+// ChangeEvent represents the parsed components of a change stream or oplog event.
+type ChangeEvent struct {
+	OpType            string
+	DBName            string
+	CollName          string
+	DocID             any
+	FullDocument      any
+	UpdateDescription any
+	EventTime         time.Time
+}
+
+func parseRawChangeEvent(raw bson.Raw) (ChangeEvent, error) {
 	if err := raw.Validate(); err != nil {
-		return "", "", "", nil, nil, nil, time.Time{}, err
+		return ChangeEvent{}, err
 	}
+	var ce ChangeEvent
 	if opVal, err := raw.LookupErr("operationType"); err == nil {
-		opType = opVal.StringValue()
+		ce.OpType = opVal.StringValue()
 	}
 	if nsVal, err := raw.LookupErr("ns"); err == nil {
 		if nsDoc, ok := nsVal.DocumentOK(); ok {
-			dbName = nsDoc.Lookup("db").StringValue()
-			collName = nsDoc.Lookup("coll").StringValue()
+			ce.DBName = nsDoc.Lookup("db").StringValue()
+			ce.CollName = nsDoc.Lookup("coll").StringValue()
 		}
 	}
 	if docKeyVal, err := raw.LookupErr("documentKey"); err == nil {
@@ -691,12 +703,12 @@ func parseRawChangeEvent(raw bson.Raw) (opType, dbName, collName string, docID i
 				if idVal.Type == bsontype.EmbeddedDocument {
 					var d bson.D
 					if err := idVal.Unmarshal(&d); err == nil {
-						docID = d
+						ce.DocID = d
 					}
 				} else {
-					var idInterface interface{}
+					var idInterface any
 					if err := idVal.Unmarshal(&idInterface); err == nil {
-						docID = idInterface
+						ce.DocID = idInterface
 					}
 				}
 			}
@@ -704,44 +716,74 @@ func parseRawChangeEvent(raw bson.Raw) (opType, dbName, collName string, docID i
 	}
 	if fullDocVal, err := raw.LookupErr("fullDocument"); err == nil {
 		if rawFullDoc, ok := fullDocVal.DocumentOK(); ok {
-			fullDoc = rawFullDoc
+			ce.FullDocument = rawFullDoc
 		}
 	}
 	if updVal, err := raw.LookupErr("updateDescription"); err == nil {
 		if rawUpdDoc, ok := updVal.DocumentOK(); ok {
-			updateDesc = rawUpdDoc
+			ce.UpdateDescription = rawUpdDoc
 		}
 	}
-	eventTime = ExtractEventTimeFromRaw(raw)
-	return opType, dbName, collName, docID, fullDoc, updateDesc, eventTime, nil
+	ce.EventTime = ExtractEventTimeFromRaw(raw)
+	return ce, nil
 }
 
-func parseBsonMChangeEvent(event bson.M) (opType, dbName, collName string, docID interface{}, fullDoc, updateDesc interface{}, eventTime time.Time) {
-	opType, _ = event["operationType"].(string)
-	if ns, ok := event["ns"].(bson.M); ok {
-		dbName, _ = ns["db"].(string)
-		collName, _ = ns["coll"].(string)
+func parseBsonDChangeEvent(event bson.D) (ChangeEvent, error) {
+	var ce ChangeEvent
+	for _, elem := range event {
+		switch elem.Key {
+		case "operationType":
+			if s, ok := elem.Value.(string); ok {
+				ce.OpType = s
+			}
+		case "ns":
+			if nsDoc, ok := elem.Value.(bson.D); ok {
+				for _, nsElem := range nsDoc {
+					switch nsElem.Key {
+					case "db":
+						if s, ok := nsElem.Value.(string); ok {
+							ce.DBName = s
+						}
+					case "coll":
+						if s, ok := nsElem.Value.(string); ok {
+							ce.CollName = s
+						}
+					}
+				}
+			}
+		case "documentKey":
+			if dkDoc, ok := elem.Value.(bson.D); ok {
+				for _, dkElem := range dkDoc {
+					if dkElem.Key == "_id" {
+						ce.DocID = dkElem.Value
+					}
+				}
+			}
+		case "fullDocument":
+			ce.FullDocument = elem.Value
+		case "updateDescription":
+			ce.UpdateDescription = elem.Value
+		case "clusterTime":
+			if ts, ok := elem.Value.(primitive.Timestamp); ok {
+				ce.EventTime = time.Unix(int64(ts.T), 0)
+			}
+		case "wallTime":
+			if t, ok := elem.Value.(time.Time); ok {
+				ce.EventTime = t
+			} else if dt, ok := elem.Value.(primitive.DateTime); ok {
+				ce.EventTime = dt.Time()
+			}
+		}
 	}
-	if documentKey, ok := event["documentKey"].(bson.M); ok {
-		docID = documentKey["_id"]
-	}
-	fullDoc = event["fullDocument"]
-	updateDesc = event["updateDescription"]
-	eventTime = ExtractEventTime(event)
-	return
+	return ce, nil
 }
 
 // ProcessEvent handles a single change event by decoding raw BSON concurrently in the worker thread
-func (w *Worker) ProcessEvent(eventArg interface{}) {
+func (w *Worker) ProcessEvent(eventArg any) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	var opType string
-	var dbName, collName string
-	var docID interface{}
-	var fullDocument interface{}
-	var updateDescription interface{}
-	var eventTime time.Time
+	var ce ChangeEvent
 	var readTime time.Time
 	var streamIndex int
 	var seqNum uint64
@@ -759,7 +801,7 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		switch inner := e.Event.(type) {
 		case bson.Raw:
 			var err error
-			opType, dbName, collName, docID, fullDocument, updateDescription, eventTime, err = parseRawChangeEvent(inner)
+			ce, err = parseRawChangeEvent(inner)
 			if err != nil {
 				w.log.Errorf("Failed to parse raw BSON change event: %v", err)
 				if w.partitionTracker != nil {
@@ -767,8 +809,16 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 				}
 				return
 			}
-		case bson.M:
-			opType, dbName, collName, docID, fullDocument, updateDescription, eventTime = parseBsonMChangeEvent(inner)
+		case bson.D:
+			var err error
+			ce, err = parseBsonDChangeEvent(inner)
+			if err != nil {
+				w.log.Errorf("Failed to parse bson.D change event: %v", err)
+				if w.partitionTracker != nil {
+					w.partitionTracker.Ack(streamIndex, seqNum)
+				}
+				return
+			}
 		default:
 			w.log.Errorf("Invalid inner event type: %T", e.Event)
 			if w.partitionTracker != nil {
@@ -778,17 +828,17 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		}
 	case bson.Raw:
 		var err error
-		opType, dbName, collName, docID, fullDocument, updateDescription, eventTime, err = parseRawChangeEvent(e)
+		ce, err = parseRawChangeEvent(e)
 		if err != nil {
 			w.log.Errorf("Failed to parse raw BSON change event: %v", err)
 			return
 		}
-	case bson.M:
-		opType, dbName, collName, docID, fullDocument, updateDescription, eventTime = parseBsonMChangeEvent(e)
-		if rt, exists := e["readTime"]; exists {
-			if t, ok := rt.(time.Time); ok {
-				readTime = t
-			}
+	case bson.D:
+		var err error
+		ce, err = parseBsonDChangeEvent(e)
+		if err != nil {
+			w.log.Errorf("Failed to parse bson.D change event: %v", err)
+			return
 		}
 	default:
 		w.log.Errorf("Invalid event type in ProcessEvent: %T", eventArg)
@@ -798,6 +848,14 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	if readTime.IsZero() {
 		readTime = time.Now()
 	}
+
+	opType := ce.OpType
+	dbName := ce.DBName
+	collName := ce.CollName
+	docID := ce.DocID
+	fullDocument := ce.FullDocument
+	updateDescription := ce.UpdateDescription
+	eventTime := ce.EventTime
 
 	namespace := fmt.Sprintf("%s.%s", dbName, collName)
 	if w.incrementalStatsManager != nil {
