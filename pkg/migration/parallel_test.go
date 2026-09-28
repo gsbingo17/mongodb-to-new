@@ -39,17 +39,17 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
-	event := bson.M{
-		"operationType": "update",
-		"ns": bson.M{
-			"db":   "testdb",
-			"coll": "testcoll",
-		},
-		"documentKey": bson.M{
-			"_id": "doc_123",
-		},
-		"fullDocument":      nil,
-		"updateDescription": nil,
+	event := bson.D{
+		{Key: "operationType", Value: "update"},
+		{Key: "ns", Value: bson.D{
+			{Key: "db", Value: "testdb"},
+			{Key: "coll", Value: "testcoll"},
+		}},
+		{Key: "documentKey", Value: bson.D{
+			{Key: "_id", Value: "doc_123"},
+		}},
+		{Key: "fullDocument", Value: nil},
+		{Key: "updateDescription", Value: nil},
 	}
 
 	// Process the event
@@ -88,17 +88,17 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndIncrementalStatsManager(
 	)
 
 	// Create an update event where fullDocument is nil
-	event := bson.M{
-		"operationType": "update",
-		"ns": bson.M{
-			"db":   "testdb",
-			"coll": "testcoll",
-		},
-		"documentKey": bson.M{
-			"_id": "doc_123",
-		},
-		"fullDocument":      nil,
-		"updateDescription": nil,
+	event := bson.D{
+		{Key: "operationType", Value: "update"},
+		{Key: "ns", Value: bson.D{
+			{Key: "db", Value: "testdb"},
+			{Key: "coll", Value: "testcoll"},
+		}},
+		{Key: "documentKey", Value: bson.D{
+			{Key: "_id", Value: "doc_123"},
+		}},
+		{Key: "fullDocument", Value: nil},
+		{Key: "updateDescription", Value: nil},
 	}
 
 	// Process the event
@@ -164,9 +164,9 @@ func TestPartitionTrackerCorrectness(t *testing.T) {
 	tracker := NewPartitionTracker(log, checkpointPath, 5*time.Minute, 2, 2)
 
 	// Register 3 events for Partition 0
-	token1, _ := bson.Marshal(bson.M{"_data": "tok1"})
-	token2, _ := bson.Marshal(bson.M{"_data": "tok2"})
-	token3, _ := bson.Marshal(bson.M{"_data": "tok3"})
+	token1, _ := bson.Marshal(bson.D{{Key: "_data", Value: "tok1"}})
+	token2, _ := bson.Marshal(bson.D{{Key: "_data", Value: "tok2"}})
+	token3, _ := bson.Marshal(bson.D{{Key: "_data", Value: "tok3"}})
 
 	seq1 := tracker.Register(0, token1, time.Now())
 	seq2 := tracker.Register(0, token2, time.Now())
@@ -233,7 +233,7 @@ func TestPartitionTrackerSinglePartition(t *testing.T) {
 	// Instantiate PartitionTracker for single partition (threshold = 1, totalPartitions = 1)
 	tracker := NewPartitionTracker(log, checkpointPath, 5*time.Minute, 1, 1)
 
-	token1, _ := bson.Marshal(bson.M{"_data": "tok1"})
+	token1, _ := bson.Marshal(bson.D{{Key: "_data", Value: "tok1"}})
 	seq1 := tracker.Register(0, token1, time.Now())
 
 	if seq1 != 1 {
@@ -286,16 +286,16 @@ func TestWorkerFlushCurrentGroupResetsIDs(t *testing.T) {
 	)
 
 	// Process an event to establish active group ID cache status
-	event1 := bson.M{
-		"operationType": "insert",
-		"ns": bson.M{
-			"db":   "testdb",
-			"coll": "testcoll",
-		},
-		"documentKey": bson.M{
-			"_id": "doc_abc",
-		},
-		"fullDocument": bson.M{"a": 1},
+	event1 := bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{
+			{Key: "db", Value: "testdb"},
+			{Key: "coll", Value: "testcoll"},
+		}},
+		{Key: "documentKey", Value: bson.D{
+			{Key: "_id", Value: "doc_abc"},
+		}},
+		{Key: "fullDocument", Value: bson.D{{Key: "a", Value: 1}}},
 	}
 	worker.ProcessEvent(event1)
 
@@ -343,16 +343,16 @@ func TestWorkerConcurrencyStateSafety(t *testing.T) {
 	done := make(chan bool)
 	go func() {
 		for i := 0; i < 100; i++ {
-			event := bson.M{
-				"operationType": "insert",
-				"ns": bson.M{
-					"db":   "testdb",
-					"coll": "testcoll",
-				},
-				"documentKey": bson.M{
-					"_id": i,
-				},
-				"fullDocument": bson.M{"val": i},
+			event := bson.D{
+				{Key: "operationType", Value: "insert"},
+				{Key: "ns", Value: bson.D{
+					{Key: "db", Value: "testdb"},
+					{Key: "coll", Value: "testcoll"},
+				}},
+				{Key: "documentKey", Value: bson.D{
+					{Key: "_id", Value: i},
+				}},
+				{Key: "fullDocument", Value: bson.D{{Key: "val", Value: i}}},
 			}
 			worker.ProcessEvent(event)
 		}
@@ -397,10 +397,10 @@ func TestWorkerShutdownConcurrencyRaceSafety(t *testing.T) {
 	)
 
 	// Keep the consumer loop active by pushing a dummy event to batchingQueue
-	worker.batchingQueue <- bson.M{
-		"operationType": "insert",
-		"ns": bson.M{"db": "db", "coll": "coll"},
-		"documentKey": bson.M{"_id": 1},
+	worker.batchingQueue <- bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "db"}, {Key: "coll", Value: "coll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: 1}}},
 	}
 
 	var wg sync.WaitGroup
@@ -449,11 +449,11 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 	)
 
 	// Process 1 operation to make w.currentGroup non-nil
-	event := bson.M{
-		"operationType": "insert",
-		"ns": bson.M{"db": "db", "coll": "coll"},
-		"documentKey": bson.M{"_id": "doc_timeout_123"},
-		"fullDocument": bson.M{"foo": "bar"},
+	event := bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "db"}, {Key: "coll", Value: "coll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: "doc_timeout_123"}}},
+		{Key: "fullDocument", Value: bson.D{{Key: "foo", Value: "bar"}}},
 	}
 	worker.ProcessEvent(event)
 
@@ -509,11 +509,11 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 	)
 
 	// Process 1 operation to keep group active in memory
-	event := bson.M{
-		"operationType": "insert",
-		"ns": bson.M{"db": "db", "coll": "coll"},
-		"documentKey": bson.M{"_id": "doc_cancel_123"},
-		"fullDocument": bson.M{"foo": "bar"},
+	event := bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "db"}, {Key: "coll", Value: "coll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: "doc_cancel_123"}}},
+		{Key: "fullDocument", Value: bson.D{{Key: "foo", Value: "bar"}}},
 	}
 	worker.ProcessEvent(event)
 
@@ -577,12 +577,12 @@ func TestWorkerSetPartitionTracker(t *testing.T) {
 
 func TestCollectionDropBSONParsing(t *testing.T) {
 	// Create a raw drop change event
-	eventDoc := bson.M{
-		"operationType": "drop",
-		"ns": bson.M{
-			"db":   "testdb",
-			"coll": "testcoll",
-		},
+	eventDoc := bson.D{
+		{Key: "operationType", Value: "drop"},
+		{Key: "ns", Value: bson.D{
+			{Key: "db", Value: "testdb"},
+			{Key: "coll", Value: "testcoll"},
+		}},
 	}
 	rawBytes, err := bson.Marshal(eventDoc)
 	if err != nil {
@@ -619,12 +619,12 @@ func TestCollectionDropBSONParsing(t *testing.T) {
 
 func TestNonDMLGracefulSkipBSONParsing(t *testing.T) {
 	// Create a raw DDL change event (e.g. dropIndexes)
-	eventDoc := bson.M{
-		"operationType": "dropIndexes",
-		"ns": bson.M{
-			"db":   "testdb",
-			"coll": "testcoll",
-		},
+	eventDoc := bson.D{
+		{Key: "operationType", Value: "dropIndexes"},
+		{Key: "ns", Value: bson.D{
+			{Key: "db", Value: "testdb"},
+			{Key: "coll", Value: "testcoll"},
+		}},
 	}
 	rawBytes, err := bson.Marshal(eventDoc)
 	if err != nil {
@@ -679,3 +679,109 @@ func TestIsDuplicateKeyError(t *testing.T) {
 	}
 }
 
+func TestWorkerProcessRawEventCompositeIDOrderPreserved(t *testing.T) {
+	log := logger.New()
+	ctx := context.Background()
+	transformer := NewFieldTransformer(false, false, true, log)
+	worker := NewWorker(
+		1,
+		ctx,
+		log,
+		nil,
+		nil,
+		10,
+		false,
+		nil,
+		nil,
+		nil,
+		true,
+		5*time.Minute,
+		8192,
+		2,
+		transformer,
+	)
+
+	// Create a raw BSON event with a composite document _id having non-alphabetical key order: {z: 100, a: 200}
+	compositeID := bson.D{{Key: "z", Value: int32(100)}, {Key: "a", Value: int32(200)}}
+	fullDoc := bson.D{{Key: "_id", Value: compositeID}, {Key: "payload", Value: "test_data"}}
+	fullDocBytes, err := bson.Marshal(fullDoc)
+	if err != nil {
+		t.Fatalf("failed to marshal fullDoc: %v", err)
+	}
+
+	rawEventBytes, err := bson.Marshal(bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "testdb"}, {Key: "coll", Value: "testcoll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: compositeID}}},
+		{Key: "fullDocument", Value: bson.Raw(fullDocBytes)},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal rawEvent: %v", err)
+	}
+
+	queueEvent := QueueEvent{
+		Event:       bson.Raw(rawEventBytes),
+		ReadTime:    time.Now(),
+		StreamIndex: 0,
+		SeqNum:      1,
+	}
+
+	worker.ProcessEvent(queueEvent)
+
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+
+	if worker.currentGroup == nil || len(worker.currentGroup.Operations) == 0 {
+		t.Fatalf("expected currentGroup with 1 operation, got nil or empty")
+	}
+
+	op := worker.currentGroup.Operations[0]
+	expectedID := `_converted:document:{"z":100,"a":200}`
+	if op.DocumentID != expectedID {
+		t.Errorf("expected converted DocumentID to be %s (slice order preserved), got %v", expectedID, op.DocumentID)
+	}
+
+	// Verify Backfill produces the exact same converted string for the same document
+	backfillDoc := bson.D{{Key: "_id", Value: compositeID}, {Key: "payload", Value: "test_data"}}
+	backfilled, err := transformer.Transform(backfillDoc, "testdb", "testcoll", nil)
+	if err != nil {
+		t.Fatalf("Backfill Transform failed: %v", err)
+	}
+	backfilledDoc := backfilled.(bson.D)
+	if backfilledDoc[0].Value != expectedID {
+		t.Errorf("Backfill transformed ID mismatch: want %s, got %v", expectedID, backfilledDoc[0].Value)
+	}
+}
+
+func TestParseBsonDChangeEvent(t *testing.T) {
+	compositeID := bson.D{{Key: "z", Value: int32(100)}, {Key: "a", Value: int32(200)}}
+	fullDoc := bson.D{{Key: "_id", Value: compositeID}, {Key: "payload", Value: "test_data"}}
+	event := bson.D{
+		{Key: "operationType", Value: "insert"},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "testdb"}, {Key: "coll", Value: "testcoll"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: compositeID}}},
+		{Key: "fullDocument", Value: fullDoc},
+		{Key: "clusterTime", Value: primitive.Timestamp{T: 1700000000, I: 1}},
+	}
+
+	ce, err := parseBsonDChangeEvent(event)
+	if err != nil {
+		t.Fatalf("parseBsonDChangeEvent failed: %v", err)
+	}
+	if ce.OpType != "insert" {
+		t.Errorf("expected OpType insert, got %s", ce.OpType)
+	}
+	if ce.DBName != "testdb" || ce.CollName != "testcoll" {
+		t.Errorf("expected testdb.testcoll, got %s.%s", ce.DBName, ce.CollName)
+	}
+	docIDD, ok := ce.DocID.(bson.D)
+	if !ok {
+		t.Fatalf("expected DocID to be bson.D, got %T", ce.DocID)
+	}
+	if len(docIDD) != 2 || docIDD[0].Key != "z" || docIDD[1].Key != "a" {
+		t.Errorf("expected composite key order [z, a] preserved, got %v", docIDD)
+	}
+	if ce.EventTime.Unix() != 1700000000 {
+		t.Errorf("expected EventTime unix 1700000000, got %v", ce.EventTime.Unix())
+	}
+}

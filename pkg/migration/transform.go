@@ -1,11 +1,13 @@
 package migration
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -45,6 +47,19 @@ func extractDocID(doc interface{}) interface{} {
 		return d["_id"]
 	case map[string]interface{}:
 		return d["_id"]
+	case bson.Raw:
+		if val, err := d.LookupErr("_id"); err == nil {
+			if val.Type == bsontype.EmbeddedDocument {
+				var idDoc bson.D
+				if err := val.Unmarshal(&idDoc); err == nil {
+					return idDoc
+				}
+			}
+			var idVal interface{}
+			if err := val.Unmarshal(&idVal); err == nil {
+				return idVal
+			}
+		}
 	}
 	return nil
 }
@@ -67,11 +82,33 @@ func toComparableIDKey(id interface{}) string {
 //   - Stringifies nested objects that contain field names exceeding maxFieldNameLength
 //
 // Returns the transformed document and an error if a field name collision is detected.
-// Supports bson.D, bson.M, map[string]interface{}, and arrays.
+// Supports bson.D, bson.M, map[string]interface{}, bson.Raw, and arrays.
 // Logs transformations at Info/Warn level with db, collection, and document ID context.
 func (t *FieldTransformer) Transform(doc interface{}, dbName, collName string, docID interface{}) (interface{}, error) {
 	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs && !t.convertInvalidIds {
 		return doc, nil
+	}
+	if rawBytes, ok := doc.([]byte); ok {
+		doc = bson.Raw(rawBytes)
+	}
+	if rawDoc, ok := doc.(bson.Raw); ok {
+		// Fast-path: if no field sanitization is needed and _id is valid, preserve raw BSON directly
+		if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
+			if t.convertInvalidIds {
+				rawID := extractDocID(rawDoc)
+				if t.isValidIDType(rawID) {
+					return rawDoc, nil
+				}
+			} else {
+				return rawDoc, nil
+			}
+		}
+		// If transformations are required, decode into bson.D to preserve slice ordering
+		var d bson.D
+		if err := bson.Unmarshal(rawDoc, &d); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal raw BSON for transformation: %w", err)
+		}
+		doc = d
 	}
 	// Root-level documents cannot be stringified (must remain documents for MongoDB insert).
 	// Warn about long keys at root level but don't stringify.
@@ -80,6 +117,9 @@ func (t *FieldTransformer) Transform(doc interface{}, dbName, collName string, d
 	}
 	if doc != nil && t.convertInvalidIds {
 		doc = t.proactivelyConvertID(doc, dbName, collName)
+	}
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
+		return doc, nil
 	}
 	return t.transformFieldNamesRecursive(doc, dbName, collName, docID, true)
 }
@@ -121,36 +161,54 @@ func (t *FieldTransformer) proactivelyConvertID(doc interface{}, dbName, collNam
 				return newDoc
 			}
 		}
+	case map[string]interface{}:
+		if id, ok := d["_id"]; ok {
+			if !t.isValidIDType(id) {
+				originalType := fmt.Sprintf("%T", id)
+				newID := serializeIDDeterministically(id)
+				if t.log != nil {
+					t.log.Infof("[%s.%s] Proactively converting invalid _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+						dbName, collName, id, originalType, newID)
+				}
+				newDoc := make(map[string]interface{}, len(d))
+				for k, v := range d {
+					newDoc[k] = v
+				}
+				newDoc["_id"] = newID
+				return newDoc
+			}
+		}
 	}
 	return doc
 }
 
 func (t *FieldTransformer) isValidIDType(id interface{}) bool {
+	return isValidIDType(id)
+}
+
+func isValidIDType(id interface{}) bool {
 	switch id.(type) {
-	case primitive.ObjectID, string, int64:
+	case primitive.ObjectID,
+		string,
+		int64, int32, int,
+		float64, float32,
+		bool,
+		primitive.Binary, []byte:
 		return true
 	default:
 		return false
 	}
 }
 
-func serializeIDDeterministically(id interface{}) string {
+func serializeIDDeterministically(id any) string {
 	switch val := id.(type) {
-	case bool:
-		return fmt.Sprintf("_converted:bool:%t", val)
-	case int32:
-		return fmt.Sprintf("_converted:int32:%d", val)
-	case int:
-		return fmt.Sprintf("_converted:int:%d", val)
-	case float64:
-		return fmt.Sprintf("_converted:double:%g", val)
-	case float32:
-		return fmt.Sprintf("_converted:float:%g", val)
 	case primitive.DateTime:
 		return fmt.Sprintf("_converted:datetime:%d", val)
-	case primitive.Binary:
-		return fmt.Sprintf("_converted:binary:%x", val.Data)
-	case []interface{}:
+	case primitive.Timestamp:
+		return fmt.Sprintf("_converted:timestamp:%d_%d", val.T, val.I)
+	case primitive.Decimal128:
+		return fmt.Sprintf("_converted:decimal128:%s", val.String())
+	case []any:
 		data, err := json.Marshal(val)
 		if err == nil {
 			return fmt.Sprintf("_converted:array:%s", string(data))
@@ -162,8 +220,8 @@ func serializeIDDeterministically(id interface{}) string {
 			return fmt.Sprintf("_converted:array:%s", string(data))
 		}
 		return fmt.Sprintf("_converted:array:%v", val)
-	case bson.D, bson.M, map[string]interface{}:
-		data, err := json.Marshal(val)
+	case bson.D:
+		data, err := marshalBsonDOrderedJSON(val)
 		if err == nil {
 			return fmt.Sprintf("_converted:document:%s", string(data))
 		}
@@ -390,6 +448,73 @@ func bsonDToMap(d bson.D) map[string]interface{} {
 	return result
 }
 
+// marshalBsonDOrderedJSON marshals a bson.D directly to a JSON object byte slice,
+// strictly preserving the exact slice ordering of the keys (no map conversion or key sorting).
+func marshalBsonDOrderedJSON(d bson.D) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, elem := range d {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(elem.Key)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+
+		valBytes, err := marshalBSONValueOrderedJSON(elem.Value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(valBytes)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// marshalBSONValueOrderedJSON recursively marshals BSON values to JSON while preserving
+// bson.D key ordering and bson.A array ordering.
+func marshalBSONValueOrderedJSON(v any) ([]byte, error) {
+	switch val := v.(type) {
+	case bson.D:
+		return marshalBsonDOrderedJSON(val)
+	case bson.A:
+		var buf bytes.Buffer
+		buf.WriteByte('[')
+		for i, item := range val {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			itemBytes, err := marshalBSONValueOrderedJSON(item)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(itemBytes)
+		}
+		buf.WriteByte(']')
+		return buf.Bytes(), nil
+	case []any:
+		var buf bytes.Buffer
+		buf.WriteByte('[')
+		for i, item := range val {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			itemBytes, err := marshalBSONValueOrderedJSON(item)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(itemBytes)
+		}
+		buf.WriteByte(']')
+		return buf.Bytes(), nil
+	default:
+		return json.Marshal(val)
+	}
+}
+
 // bsonValueToInterface recursively converts bson types to standard Go types for JSON marshaling.
 func bsonValueToInterface(v interface{}) interface{} {
 	switch val := v.(type) {
@@ -421,7 +546,7 @@ func bsonValueToInterface(v interface{}) interface{} {
 // TransformBatch applies Transform to each document in a batch.
 // Extracts _id from each document for logging context.
 func (t *FieldTransformer) TransformBatch(batch []interface{}, dbName, collName string) ([]interface{}, error) {
-	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs && !t.convertInvalidIds {
 		return batch, nil
 	}
 	result := make([]interface{}, len(batch))
